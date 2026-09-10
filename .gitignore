@@ -10,7 +10,6 @@
 !/GelGenerator.exe
 /dist/
 # Local acquisition settings and generated data
-/json/
 *.gel
 *.csv
 !tests/fixtures/*.csv

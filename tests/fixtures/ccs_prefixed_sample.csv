@@ -1,0 +1,3 @@
+C28xx_CPU1: GEL Output: sample,C28xx_CPU1 : angle_yaw,GEL Output: state
+C28xx_CPU1: GEL Output: 0,C28xx_CPU1: GEL Output: 1.25,C28xx_CPU1 : 2
+Cortex_M3_0: GEL Output: 1,Cortex_M3_0: 2.5,GEL Output: 3

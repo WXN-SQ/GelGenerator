@@ -1,0 +1,33 @@
+# .NET / IDE outputs
+**/bin/
+**/obj/
+.vs/
+.idea/
+*.user
+*.suo
+*.pdb
+*.exe
+!/GelGenerator.exe
+/dist/
+# Local acquisition settings and generated data
+/json/
+*.gel
+*.csv
+!tests/fixtures/*.csv
+*.xlsx
+*.xls
+*.log
+*.tmp
+*.bak
+~$*
+# Temporary tool runtimes and validation output
+node_modules/
+.artifact-runtime/
+/tests/sample_validation.*
+/outputs/
+.env
+.env.*
+*.pem
+*.key
+Thumbs.db
+Desktop.ini

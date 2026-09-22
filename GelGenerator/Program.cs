@@ -4,9 +4,12 @@ using System.Drawing;
 using System.Globalization;
 using System.IO;
 using System.IO.Compression;
+using System.Net;
+using System.Net.Sockets;
 using System.Security;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
@@ -29,6 +32,7 @@ namespace GelGenerator
         public string Expression { get; set; }
         public string Type { get; set; }
         public string OutputFormat { get; set; }
+        public bool SendToVofa { get; set; }
     }
 
     public sealed class GeneratorConfig
@@ -38,6 +42,10 @@ namespace GelGenerator
         public string PeriodUnit { get; set; }
         public string GelPath { get; set; }
         public List<VariableItem> Variables { get; set; }
+        public bool VofaEnabled { get; set; }
+        public string VofaAddress { get; set; }
+        public int VofaPort { get; set; }
+        public bool VofaReplayExisting { get; set; }
     }
 
     public sealed class MainForm : Form
@@ -53,6 +61,21 @@ namespace GelGenerator
         private readonly CheckBox chkOverwriteXlsx = new CheckBox();
         private readonly TextBox txtXlsxDirectory = new TextBox();
         private readonly Label lblConvertStatus = new Label();
+        private readonly CheckBox chkVofaEnabled = new CheckBox();
+        private readonly TextBox txtBridgeCsvPath = new TextBox();
+        private readonly TextBox txtBridgeScriptPath = new TextBox();
+        private readonly TextBox txtVofaAddress = new TextBox();
+        private readonly NumericUpDown numVofaPort = new NumericUpDown();
+        private readonly RadioButton radFollowNew = new RadioButton();
+        private readonly RadioButton radReplay = new RadioButton();
+        private readonly Button btnBridgeStart = new Button();
+        private readonly Button btnBridgeStop = new Button();
+        private readonly Label lblBridgeStatus = new Label();
+        private readonly Label lblBridgeConnection = new Label();
+        private readonly Label lblBridgeCounters = new Label();
+        private readonly Label lblBridgeError = new Label();
+        private readonly TextBox txtBridgeChannels = new TextBox();
+        private VofaBridgeService bridgeService;
 
         internal static readonly string[] GelTypes =
         {
@@ -77,11 +100,14 @@ namespace GelGenerator
 
             var tabs = new TabControl { Dock = DockStyle.Fill };
             var generatorPage = new TabPage("GEL 脚本生成");
+            var bridgePage = new TabPage("VOFA+ 实时桥接");
             var converterPage = new TabPage("CSV 转 XLSX");
             tabs.TabPages.Add(generatorPage);
+            tabs.TabPages.Add(bridgePage);
             tabs.TabPages.Add(converterPage);
             Controls.Add(tabs);
             BuildGeneratorUi(generatorPage);
+            BuildBridgeUi(bridgePage);
             BuildConverterUi(converterPage);
             txtCsvPath.Text = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
@@ -91,6 +117,14 @@ namespace GelGenerator
             txtGelPath.Text = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
                 "data_logger.gel");
+            txtVofaAddress.Text = "127.0.0.1";
+            numVofaPort.Value = 1347;
+            radFollowNew.Checked = true;
+            txtCsvPath.TextChanged += delegate { SyncBridgePaths(); };
+            txtGelPath.TextChanged += delegate { SyncBridgePaths(); };
+            chkVofaEnabled.CheckedChanged += delegate { ApplyVofaEnabledState(true); };
+            SyncBridgePaths();
+            ApplyVofaEnabledState(false);
         }
 
         private void BuildGeneratorUi(Control parent)
@@ -145,6 +179,10 @@ namespace GelGenerator
             var btnGel = ButtonFor("浏览…", delegate { BrowseGel(); });
             settings.Controls.Add(btnGel, 2, 2);
             settings.SetColumnSpan(btnGel, 2);
+            chkVofaEnabled.Text = "启用 VOFA+ 桥接并生成独立脚本";
+            chkVofaEnabled.AutoSize = true;
+            settings.Controls.Add(chkVofaEnabled, 1, 3);
+            settings.SetColumnSpan(chkVofaEnabled, 3);
             root.Controls.Add(settings, 0, 0);
 
             var note = new Label
@@ -160,9 +198,12 @@ namespace GelGenerator
             grid.AllowUserToAddRows = true;
             grid.AllowUserToDeleteRows = true;
             grid.AutoGenerateColumns = false;
-            grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+            /* 普通点击只选中单元格；点击最左侧行头时才选择整行。 */
+            grid.SelectionMode = DataGridViewSelectionMode.RowHeaderSelect;
             grid.MultiSelect = true;
             grid.RowHeadersWidth = 55;
+            grid.ClipboardCopyMode = DataGridViewClipboardCopyMode.EnableWithoutHeaderText;
+            grid.EditMode = DataGridViewEditMode.EditOnKeystrokeOrF2;
             grid.Columns.Add(new DataGridViewTextBoxColumn
             {
                 Name = "NameColumn", HeaderText = "CSV 列名称", DataPropertyName = "Name",
@@ -187,15 +228,33 @@ namespace GelGenerator
             };
             formatColumn.Items.AddRange(OutputFormats);
             grid.Columns.Add(formatColumn);
+            grid.Columns.Add(new DataGridViewCheckBoxColumn
+            {
+                Name = "VofaColumn", HeaderText = "发送到 VOFA+", DataPropertyName = "SendToVofa",
+                Width = 110, ThreeState = false
+            });
             grid.DefaultValuesNeeded += delegate(object sender, DataGridViewRowEventArgs e)
             {
                 e.Row.Cells["TypeColumn"].Value = "float32";
                 e.Row.Cells["FormatColumn"].Value = "十进制";
+                e.Row.Cells["VofaColumn"].Value = chkVofaEnabled.Checked;
             };
             grid.DataError += delegate(object sender, DataGridViewDataErrorEventArgs e)
             {
                 e.ThrowException = false;
             };
+            grid.CurrentCellDirtyStateChanged += delegate
+            {
+                if (grid.IsCurrentCellDirty && grid.CurrentCell != null && grid.CurrentCell.OwningColumn.Name == "VofaColumn")
+                    grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
+            };
+            grid.CellValueChanged += delegate(object sender, DataGridViewCellEventArgs e)
+            {
+                if (e.RowIndex >= 0 && e.ColumnIndex >= 0 && grid.Columns[e.ColumnIndex].Name == "VofaColumn")
+                    RefreshBridgeChannels();
+            };
+            grid.CellEndEdit += delegate { RefreshBridgeChannels(); };
+            grid.RowsRemoved += delegate { RefreshBridgeChannels(); };
             root.Controls.Add(grid, 0, 2);
 
             var rowButtons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
@@ -221,6 +280,75 @@ namespace GelGenerator
             generate.Padding = new Padding(16, 5, 16, 5);
             bottom.Controls.Add(generate, 1, 0);
             root.Controls.Add(bottom, 0, 4);
+        }
+
+        private void BuildBridgeUi(Control parent)
+        {
+            var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(12), ColumnCount = 1, RowCount = 5 };
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            parent.Controls.Add(root);
+
+            var intro = new Label
+            {
+                AutoSize = true,
+                Text = "监听 CCS/GEL 持续追加的 CSV，清除调试前缀，并通过 TCP Server 向 VOFA+ FireWater 实时发送。",
+                Padding = new Padding(0, 0, 0, 8)
+            };
+            root.Controls.Add(intro, 0, 0);
+
+            var settings = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 4 };
+            settings.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            settings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            settings.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            settings.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            settings.Controls.Add(LabelFor("CSV 文件："), 0, 0);
+            txtBridgeCsvPath.ReadOnly = true; txtBridgeCsvPath.Dock = DockStyle.Fill;
+            settings.Controls.Add(txtBridgeCsvPath, 1, 0); settings.SetColumnSpan(txtBridgeCsvPath, 3);
+            settings.Controls.Add(LabelFor("独立脚本："), 0, 1);
+            txtBridgeScriptPath.ReadOnly = true; txtBridgeScriptPath.Dock = DockStyle.Fill;
+            settings.Controls.Add(txtBridgeScriptPath, 1, 1); settings.SetColumnSpan(txtBridgeScriptPath, 3);
+            settings.Controls.Add(LabelFor("监听地址："), 0, 2);
+            txtVofaAddress.Width = 180; settings.Controls.Add(txtVofaAddress, 1, 2);
+            settings.Controls.Add(LabelFor("端口："), 2, 2);
+            numVofaPort.Minimum = 1; numVofaPort.Maximum = 65535; numVofaPort.Width = 100;
+            settings.Controls.Add(numVofaPort, 3, 2);
+            radFollowNew.Text = "仅跟随新增数据"; radFollowNew.AutoSize = true;
+            radReplay.Text = "回放已有数据后继续跟随"; radReplay.AutoSize = true;
+            var modes = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
+            modes.Controls.Add(radFollowNew); modes.Controls.Add(radReplay);
+            settings.Controls.Add(LabelFor("启动模式："), 0, 3);
+            settings.Controls.Add(modes, 1, 3); settings.SetColumnSpan(modes, 3);
+            root.Controls.Add(settings, 0, 1);
+
+            txtBridgeChannels.Dock = DockStyle.Fill;
+            txtBridgeChannels.Multiline = true;
+            txtBridgeChannels.ReadOnly = true;
+            txtBridgeChannels.ScrollBars = ScrollBars.Vertical;
+            txtBridgeChannels.Font = new Font("Consolas", 9F);
+            root.Controls.Add(txtBridgeChannels, 0, 2);
+
+            var state = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 1 };
+            lblBridgeStatus.Text = "状态：未启用 VOFA+ 桥接。";
+            lblBridgeConnection.Text = "连接：未监听";
+            lblBridgeCounters.Text = "已发送：0；跳过：0";
+            lblBridgeError.Text = "最近错误：无";
+            lblBridgeError.AutoSize = true;
+            state.Controls.Add(lblBridgeStatus); state.Controls.Add(lblBridgeConnection);
+            state.Controls.Add(lblBridgeCounters); state.Controls.Add(lblBridgeError);
+            root.Controls.Add(state, 0, 3);
+
+            var buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft };
+            btnBridgeStop.Text = "停止桥接"; btnBridgeStop.AutoSize = true; btnBridgeStop.Enabled = false;
+            btnBridgeStop.Click += delegate { StopBridge(); };
+            btnBridgeStart.Text = "启动桥接"; btnBridgeStart.AutoSize = true;
+            btnBridgeStart.Font = new Font(Font, FontStyle.Bold);
+            btnBridgeStart.Click += delegate { StartBridge(); };
+            buttons.Controls.Add(btnBridgeStop); buttons.Controls.Add(btnBridgeStart);
+            root.Controls.Add(buttons, 0, 4);
         }
 
         private void BuildConverterUi(Control parent)
@@ -447,11 +575,153 @@ namespace GelGenerator
             lblConvertStatus.Text = text;
         }
 
+        private void SyncBridgePaths()
+        {
+            txtBridgeCsvPath.Text = txtCsvPath.Text;
+            txtBridgeScriptPath.Text = BridgeScriptPath(txtGelPath.Text);
+        }
+
+        internal static string BridgeScriptPath(string gelPath)
+        {
+            if (String.IsNullOrWhiteSpace(gelPath)) return String.Empty;
+            try
+            {
+                string dir = Path.GetDirectoryName(gelPath) ?? String.Empty;
+                return Path.Combine(dir, Path.GetFileNameWithoutExtension(gelPath) + "_vofa_bridge.ps1");
+            }
+            catch { return String.Empty; }
+        }
+
+        private void ApplyVofaEnabledState(bool userChanged)
+        {
+            bool enabled = chkVofaEnabled.Checked;
+            if (!enabled || userChanged)
+            {
+                foreach (DataGridViewRow row in grid.Rows)
+                    if (!row.IsNewRow) row.Cells["VofaColumn"].Value = enabled;
+            }
+            grid.Columns["VofaColumn"].ReadOnly = !enabled;
+            txtVofaAddress.Enabled = enabled;
+            numVofaPort.Enabled = enabled;
+            radFollowNew.Enabled = enabled;
+            radReplay.Enabled = enabled;
+            btnBridgeStart.Enabled = enabled && bridgeService == null;
+            if (!enabled && bridgeService != null) StopBridge();
+            lblBridgeStatus.Text = enabled ? "状态：已启用，等待启动。" : "状态：未启用 VOFA+ 桥接；请先在 GEL 脚本生成页启用。";
+            RefreshBridgeChannels();
+        }
+
+        private void RefreshBridgeChannels()
+        {
+            var names = new List<string> { "sample" };
+            foreach (DataGridViewRow row in grid.Rows)
+            {
+                if (row.IsNewRow) continue;
+                bool selected = false;
+                try { selected = Convert.ToBoolean(row.Cells["VofaColumn"].Value ?? false, CultureInfo.InvariantCulture); }
+                catch { }
+                if (!selected) continue;
+                string name = CellText(row, "NameColumn");
+                if (!String.IsNullOrWhiteSpace(name)) names.Add(name);
+            }
+            txtBridgeChannels.Text = "当前通道顺序：" + Environment.NewLine + String.Join(Environment.NewLine, names.ToArray());
+        }
+
+        private void CopyChannelNames(IList<VariableItem> variables)
+        {
+            var names = new List<string> { "sample" };
+            foreach (VariableItem item in variables) if (item.SendToVofa) names.Add(item.Name);
+            try { Clipboard.SetText(String.Join(Environment.NewLine, names.ToArray())); }
+            catch (Exception ex) { lblBridgeError.Text = "最近错误：通道名称复制失败：" + ex.Message; }
+        }
+
+        private BridgeOptions CurrentBridgeOptions(bool validate)
+        {
+            List<VariableItem> variables = ReadVariables(validate);
+            var selected = new List<int>();
+            var hexColumns = new bool[variables.Count + 1];
+            for (int i = 0; i < variables.Count; i++) if (variables[i].SendToVofa) selected.Add(i + 1);
+            for (int i = 0; i < variables.Count; i++) hexColumns[i + 1] = variables[i].OutputFormat == "十六进制";
+            if (validate && !chkVofaEnabled.Checked) throw new InvalidOperationException("请先启用 VOFA+ 桥接。");
+            if (validate && selected.Count == 0) throw new InvalidOperationException("请至少选择一个发送到 VOFA+ 的变量。");
+            IPAddress address;
+            if (!IPAddress.TryParse(txtVofaAddress.Text.Trim(), out address))
+                throw new InvalidOperationException("监听地址不是有效 IP 地址。");
+            return new BridgeOptions
+            {
+                CsvPath = txtCsvPath.Text,
+                Address = address,
+                Port = Decimal.ToInt32(numVofaPort.Value),
+                ReplayExisting = radReplay.Checked,
+                PeriodMs = PeriodMilliseconds(),
+                ExpectedColumns = variables.Count + 1,
+                SelectedColumns = selected.ToArray(),
+                HexColumns = hexColumns,
+                ChannelNames = ChannelNames(variables)
+            };
+        }
+
+        private static string[] ChannelNames(IList<VariableItem> variables)
+        {
+            var names = new List<string> { "sample" };
+            foreach (VariableItem item in variables) if (item.SendToVofa) names.Add(item.Name);
+            return names.ToArray();
+        }
+
+        private void StartBridge()
+        {
+            try
+            {
+                BridgeOptions options = CurrentBridgeOptions(true);
+                bridgeService = new VofaBridgeService(options, BridgeStatusChanged);
+                bridgeService.Start();
+                btnBridgeStart.Enabled = false;
+                btnBridgeStop.Enabled = true;
+                CopyChannelNames(ReadVariables(true));
+                lblBridgeStatus.Text = "状态：桥接运行中；通道名称已复制。";
+            }
+            catch (Exception ex)
+            {
+                if (bridgeService != null) { bridgeService.Dispose(); bridgeService = null; }
+                lblBridgeError.Text = "最近错误：" + ex.Message;
+                MessageBox.Show(this, ex.Message, "无法启动桥接", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private void StopBridge()
+        {
+            if (bridgeService != null) { bridgeService.Dispose(); bridgeService = null; }
+            btnBridgeStop.Enabled = false;
+            btnBridgeStart.Enabled = chkVofaEnabled.Checked;
+            lblBridgeStatus.Text = "状态：桥接已停止。";
+            lblBridgeConnection.Text = "连接：未监听";
+        }
+
+        private void BridgeStatusChanged(BridgeStatus status)
+        {
+            if (IsDisposed) return;
+            if (InvokeRequired) { BeginInvoke(new Action<BridgeStatus>(BridgeStatusChanged), status); return; }
+            lblBridgeConnection.Text = "连接：" + (status.ClientConnected ? "VOFA+ 已连接" : "等待 VOFA+ 连接");
+            lblBridgeCounters.Text = "已发送：" + status.Sent + "；跳过：" + status.Skipped;
+            lblBridgeError.Text = "最近错误：" + (String.IsNullOrWhiteSpace(status.LastError) ? "无" : status.LastError);
+            lblBridgeError.ForeColor = String.IsNullOrWhiteSpace(status.LastError) ? SystemColors.ControlText : Color.DarkRed;
+            if (status.ColumnMismatch) lblBridgeStatus.Text = "状态：检测到列数变化，已暂停发送。";
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (bridgeService != null && MessageBox.Show(this, "VOFA+ 桥接正在运行。关闭程序将停止桥接，是否继续？", "确认关闭", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            { e.Cancel = true; return; }
+            StopBridge();
+            base.OnFormClosing(e);
+        }
+
         private void AddRow()
         {
             int index = grid.Rows.Add();
             grid.Rows[index].Cells["TypeColumn"].Value = "float32";
             grid.Rows[index].Cells["FormatColumn"].Value = "十进制";
+            grid.Rows[index].Cells["VofaColumn"].Value = chkVofaEnabled.Checked;
             grid.CurrentCell = grid.Rows[index].Cells["NameColumn"];
             grid.BeginEdit(true);
         }
@@ -499,6 +769,7 @@ namespace GelGenerator
                 string expression = CellText(row, "ExpressionColumn");
                 string type = CellText(row, "TypeColumn");
                 string outputFormat = CellText(row, "FormatColumn");
+                bool sendToVofa = Convert.ToBoolean(row.Cells["VofaColumn"].Value ?? false, CultureInfo.InvariantCulture);
                 if (validate)
                 {
                     if (String.IsNullOrWhiteSpace(name)) throw new InvalidOperationException("第 " + logicalRow + " 行的 CSV 列名称为空。");
@@ -508,7 +779,7 @@ namespace GelGenerator
                     if (Array.IndexOf(GelTypes, type) < 0) throw new InvalidOperationException("第 " + logicalRow + " 行的变量类型无效。");
                     GelTemplate.ValidateTypeAndFormat(type, outputFormat);
                 }
-                list.Add(new VariableItem { Name = name, Expression = expression, Type = type, OutputFormat = outputFormat });
+                list.Add(new VariableItem { Name = name, Expression = expression, Type = type, OutputFormat = outputFormat, SendToVofa = sendToVofa });
             }
             if (validate && list.Count == 0) throw new InvalidOperationException("请至少添加一个采集变量。");
             return list;
@@ -548,11 +819,20 @@ namespace GelGenerator
                 ValidatePaths();
                 List<VariableItem> variables = ReadVariables(true);
                 int period = PeriodMilliseconds();
+                BridgeOptions bridgeOptions = chkVofaEnabled.Checked ? CurrentBridgeOptions(true) : null;
                 string script = GelTemplate.Build(txtCsvPath.Text, period, variables);
                 GelTemplate.ValidateGeneratedScript(script, variables.Count);
                 File.WriteAllText(txtGelPath.Text, script, new UTF8Encoding(false));
+                string extra = String.Empty;
+                if (chkVofaEnabled.Checked)
+                {
+                    string bridgePath = BridgeScriptPath(txtGelPath.Text);
+                    File.WriteAllText(bridgePath, BridgePowerShellTemplate.Build(bridgeOptions), new UTF8Encoding(true));
+                    CopyChannelNames(variables);
+                    extra = "\nVOFA+ 桥接脚本：\n" + bridgePath + "\n\n通道名称已复制到剪贴板。";
+                }
                 statusLabel.Text = "生成成功：" + txtGelPath.Text;
-                MessageBox.Show(this, "GEL 文件生成成功：\n" + txtGelPath.Text, "完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show(this, "GEL 文件生成成功：\n" + txtGelPath.Text + extra, "完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {
@@ -570,7 +850,11 @@ namespace GelGenerator
                 PeriodValue = numPeriod.Value,
                 PeriodUnit = cmbPeriodUnit.Text,
                 GelPath = txtGelPath.Text,
-                Variables = ReadVariables(validate)
+                Variables = ReadVariables(validate),
+                VofaEnabled = chkVofaEnabled.Checked,
+                VofaAddress = txtVofaAddress.Text,
+                VofaPort = Decimal.ToInt32(numVofaPort.Value),
+                VofaReplayExisting = radReplay.Checked
             };
         }
 
@@ -606,19 +890,289 @@ namespace GelGenerator
                     if (value > numPeriod.Maximum) value = numPeriod.Maximum;
                     numPeriod.Value = value;
                     cmbPeriodUnit.SelectedItem = config.PeriodUnit == "s" ? "s" : "ms";
+                    txtVofaAddress.Text = String.IsNullOrWhiteSpace(config.VofaAddress) ? "127.0.0.1" : config.VofaAddress;
+                    numVofaPort.Value = config.VofaPort >= 1 && config.VofaPort <= 65535 ? config.VofaPort : 1347;
+                    radReplay.Checked = config.VofaReplayExisting;
+                    radFollowNew.Checked = !config.VofaReplayExisting;
+                    chkVofaEnabled.Checked = config.VofaEnabled;
                     grid.Rows.Clear();
                     if (config.Variables != null)
                     {
                         foreach (VariableItem item in config.Variables)
                         {
                             VariableItem migrated = GelTemplate.MigrateLegacy(item);
-                            grid.Rows.Add(migrated.Name, migrated.Expression, migrated.Type, migrated.OutputFormat);
+                            grid.Rows.Add(migrated.Name, migrated.Expression, migrated.Type, migrated.OutputFormat, config.VofaEnabled && item.SendToVofa);
                         }
                     }
+                    ApplyVofaEnabledState(false);
                     statusLabel.Text = "配置已打开：" + dialog.FileName;
                 }
             }
             catch (Exception ex) { MessageBox.Show(this, ex.Message, "打开配置失败", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        }
+    }
+
+    internal sealed class BridgeOptions
+    {
+        public string CsvPath;
+        public IPAddress Address;
+        public int Port;
+        public bool ReplayExisting;
+        public int PeriodMs;
+        public int ExpectedColumns;
+        public int[] SelectedColumns;
+        public bool[] HexColumns;
+        public string[] ChannelNames;
+    }
+
+    internal sealed class BridgeStatus
+    {
+        public bool ClientConnected;
+        public long Sent;
+        public long Skipped;
+        public string LastError;
+        public bool ColumnMismatch;
+    }
+
+    internal sealed class VofaBridgeService : IDisposable
+    {
+        private readonly BridgeOptions options;
+        private readonly Action<BridgeStatus> report;
+        private readonly ManualResetEvent stopEvent = new ManualResetEvent(false);
+        private readonly object sync = new object();
+        private TcpListener listener;
+        private TcpClient client;
+        private Thread worker;
+        private long sent;
+        private long skipped;
+        private string lastError;
+        private bool columnMismatch;
+
+        public VofaBridgeService(BridgeOptions options, Action<BridgeStatus> report)
+        {
+            this.options = options;
+            this.report = report;
+        }
+
+        public void Start()
+        {
+            listener = new TcpListener(options.Address, options.Port);
+            listener.Start(1);
+            worker = new Thread(Run) { IsBackground = true, Name = "VOFA CSV Bridge" };
+            worker.Start();
+            Publish();
+        }
+
+        public int BoundPort { get { return listener == null ? 0 : ((IPEndPoint)listener.LocalEndpoint).Port; } }
+
+        private void Run()
+        {
+            long position = 0;
+            long replayBoundary = 0;
+            bool initialized = false;
+            var pending = new List<byte>();
+            DateTime lastWrite = DateTime.MinValue;
+            while (!stopEvent.WaitOne(100))
+            {
+                try
+                {
+                    AcceptClientIfAvailable();
+                    if (options.ReplayExisting && !initialized && !HasClient()) continue;
+                    if (!File.Exists(options.CsvPath)) { SetError("等待 CSV 文件出现：" + options.CsvPath, false); continue; }
+                    using (var stream = new FileStream(options.CsvPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                    {
+                        DateTime write = File.GetLastWriteTimeUtc(options.CsvPath);
+                        if (!initialized)
+                        {
+                            replayBoundary = stream.Length;
+                            position = options.ReplayExisting ? 0 : stream.Length;
+                            initialized = true;
+                            lastWrite = write;
+                            SetError(null, false);
+                        }
+                        else if (stream.Length < position || (write != lastWrite && stream.Length <= position))
+                        {
+                            position = 0; pending.Clear(); columnMismatch = false; replayBoundary = 0;
+                        }
+                        lastWrite = write;
+                        if (stream.Length > position)
+                        {
+                            stream.Position = position;
+                            byte[] buffer = new byte[Math.Min(65536, (int)Math.Min(Int32.MaxValue, stream.Length - position))];
+                            int count;
+                            while ((count = stream.Read(buffer, 0, buffer.Length)) > 0)
+                            {
+                                long blockStart = position;
+                                position += count;
+                                for (int i = 0; i < count; i++)
+                                {
+                                    byte value = buffer[i];
+                                    if (value == 10)
+                                    {
+                                        if (pending.Count > 0 && pending[pending.Count - 1] == 13) pending.RemoveAt(pending.Count - 1);
+                                        string line = DecodeLine(pending.ToArray());
+                                        pending.Clear();
+                                        bool historical = options.ReplayExisting && (blockStart + i + 1) <= replayBoundary;
+                                        ProcessLine(line, historical);
+                                    }
+                                    else pending.Add(value);
+                                }
+                                if (stopEvent.WaitOne(0)) return;
+                            }
+                        }
+                    }
+                }
+                catch (IOException ex) { SetError("CSV 暂时不可读：" + ex.Message, false); }
+                catch (UnauthorizedAccessException ex) { SetError("CSV 访问被拒绝：" + ex.Message, false); }
+                catch (Exception ex) { SetError(ex.Message, false); }
+            }
+        }
+
+        private void AcceptClientIfAvailable()
+        {
+            if (listener == null || !listener.Pending()) return;
+            TcpClient next = listener.AcceptTcpClient();
+            next.NoDelay = true;
+            lock (sync)
+            {
+                if (client != null) try { client.Close(); } catch { }
+                client = next;
+            }
+            Publish();
+        }
+
+        private bool HasClient()
+        {
+            lock (sync) return client != null && client.Connected;
+        }
+
+        private void ProcessLine(string line, bool historical)
+        {
+            string frame, error;
+            bool header, mismatch;
+            if (!CcsCsvConverter.TryBuildFireWaterFrame(line, options.ExpectedColumns, options.SelectedColumns, options.HexColumns, out frame, out header, out mismatch, out error))
+            {
+                if (header)
+                {
+                    if (mismatch) { columnMismatch = true; SetError("CSV 表头列数与当前 GEL 配置不一致，已暂停发送。", true); }
+                    return;
+                }
+                skipped++;
+                SetError(error, mismatch);
+                return;
+            }
+            if (columnMismatch) return;
+            TcpClient current;
+            lock (sync) current = client;
+            if (current == null || !current.Connected) { CloseClient(); return; }
+            try
+            {
+                byte[] bytes = Encoding.ASCII.GetBytes(frame + "\n");
+                current.GetStream().Write(bytes, 0, bytes.Length);
+                sent++;
+                lastError = null;
+                Publish();
+                if (historical) stopEvent.WaitOne(Math.Max(1, options.PeriodMs));
+            }
+            catch (Exception ex) { CloseClient(); SetError("VOFA+ 连接已断开：" + ex.Message, false); }
+        }
+
+        private static string DecodeLine(byte[] bytes)
+        {
+            if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+                return Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3);
+            try { return new UTF8Encoding(false, true).GetString(bytes); }
+            catch (DecoderFallbackException) { return Encoding.GetEncoding(936).GetString(bytes); }
+        }
+
+        private void SetError(string error, bool mismatch)
+        {
+            lastError = error;
+            if (mismatch) columnMismatch = true;
+            Publish();
+        }
+
+        private void CloseClient()
+        {
+            lock (sync)
+            {
+                if (client != null) try { client.Close(); } catch { }
+                client = null;
+            }
+            Publish();
+        }
+
+        private void Publish()
+        {
+            if (report == null) return;
+            TcpClient current;
+            lock (sync) current = client;
+            report(new BridgeStatus { ClientConnected = current != null && current.Connected, Sent = sent, Skipped = skipped, LastError = lastError, ColumnMismatch = columnMismatch });
+        }
+
+        public void Dispose()
+        {
+            stopEvent.Set();
+            CloseClient();
+            if (listener != null) try { listener.Stop(); } catch { }
+            if (worker != null && worker.IsAlive) worker.Join(2000);
+            stopEvent.Dispose();
+        }
+    }
+
+    internal static class BridgePowerShellTemplate
+    {
+        public static string Build(BridgeOptions options)
+        {
+            var b = new StringBuilder();
+            b.AppendLine("# VOFA+ FireWater CSV 实时桥接；由 GelGenerator 自动生成");
+            b.AppendLine("param(");
+            b.AppendLine("  [string]$CsvPath = '" + Ps(options.CsvPath) + "',");
+            b.AppendLine("  [string]$ListenAddress = '" + Ps(options.Address.ToString()) + "',");
+            b.AppendLine("  [int]$Port = " + options.Port.ToString(CultureInfo.InvariantCulture) + ",");
+            b.AppendLine("  [switch]$ReplayExisting = $" + (options.ReplayExisting ? "true" : "false"));
+            b.AppendLine(")");
+            b.AppendLine("$ErrorActionPreference = 'Stop'");
+            b.AppendLine("$expectedColumns = " + options.ExpectedColumns.ToString(CultureInfo.InvariantCulture));
+            b.AppendLine("$selectedColumns = @(" + JoinInts(options.SelectedColumns) + ")");
+            b.AppendLine("$hexColumns = @(" + JoinHexIndexes(options.HexColumns) + ")");
+            b.AppendLine("$periodMs = " + options.PeriodMs.ToString(CultureInfo.InvariantCulture));
+            b.AppendLine("$listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Parse($ListenAddress), $Port)");
+            b.AppendLine("$client = $null; $position = 0L; $replayBoundary = 0L; $initialized = $false; $pending = [Collections.Generic.List[byte]]::new()");
+            b.AppendLine("function Clean-Cell([string]$value) { $v = $value -replace '(?i)(?:(?:[A-Za-z0-9_.-]*(?:C28xx|CPU|Cortex|C6\\dxx)[A-Za-z0-9_.-]*)\\s*:\\s*)?GEL\\s+Output\\s*:\\s*',''; $p=$v.LastIndexOf(':'); if($p -ge 0){$v=$v.Substring($p+1)}; return $v.Trim() }");
+            b.AppendLine("function Send-Line([string]$line) {");
+            b.AppendLine("  if([string]::IsNullOrWhiteSpace($line)){return}; $cells=@($line.Split(',') | ForEach-Object { Clean-Cell $_ })");
+            b.AppendLine("  $sample=0.0; if(-not [double]::TryParse($cells[0],[Globalization.NumberStyles]::Float,[Globalization.CultureInfo]::InvariantCulture,[ref]$sample)){return}");
+            b.AppendLine("  if($cells.Count -ne $expectedColumns){Write-Warning \"列数变化：期望 $expectedColumns，实际 $($cells.Count)，该行已跳过。\"; return}");
+            b.AppendLine("  $out=[Collections.Generic.List[string]]::new(); $out.Add($sample.ToString('R',[Globalization.CultureInfo]::InvariantCulture))");
+            b.AppendLine("  foreach($i in $selectedColumns){ if($hexColumns -contains $i){$t=$cells[$i]; if($t.StartsWith('0x')){$t=$t.Substring(2)}; try{$out.Add(([Convert]::ToUInt64($t,16)).ToString())}catch{return}} else {$n=0.0; if(-not [double]::TryParse($cells[$i],[Globalization.NumberStyles]::Float,[Globalization.CultureInfo]::InvariantCulture,[ref]$n)){return}; $out.Add($n.ToString('R',[Globalization.CultureInfo]::InvariantCulture))} }");
+            b.AppendLine("  if($null -ne $script:client -and $script:client.Connected){try{$bytes=[Text.Encoding]::ASCII.GetBytes(($out -join ',')+\"`n\"); $script:client.GetStream().Write($bytes,0,$bytes.Length)}catch{$script:client.Close();$script:client=$null}}");
+            b.AppendLine("}");
+            b.AppendLine("try {");
+            b.AppendLine("  $listener.Start(); Write-Host \"桥接已启动：$ListenAddress`:$Port；等待 VOFA+ TCP Client。\"");
+            b.AppendLine("  while($true){");
+            b.AppendLine("    if($listener.Pending()){if($null -ne $client){$client.Close()};$client=$listener.AcceptTcpClient();$client.NoDelay=$true;Write-Host 'VOFA+ 已连接。'}");
+            b.AppendLine("    if($ReplayExisting -and -not $initialized -and ($null -eq $client -or -not $client.Connected)){Start-Sleep -Milliseconds 100;continue}");
+            b.AppendLine("    if(-not (Test-Path -LiteralPath $CsvPath)){Start-Sleep -Milliseconds 200;continue}");
+            b.AppendLine("    try{$fs=[IO.File]::Open($CsvPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete); if(-not $initialized){$replayBoundary=$fs.Length;$position=if($ReplayExisting){0}else{$fs.Length};$initialized=$true}; if($fs.Length -lt $position){$position=0;$replayBoundary=0;$pending.Clear()}; if($fs.Length -gt $position){$fs.Position=$position;$buffer=New-Object byte[] 65536; while(($count=$fs.Read($buffer,0,$buffer.Length)) -gt 0){$blockStart=$position;$position+=$count;for($j=0;$j -lt $count;$j++){if($buffer[$j] -eq 10){if($pending.Count -gt 0 -and $pending[$pending.Count-1] -eq 13){$pending.RemoveAt($pending.Count-1)};$line=[Text.Encoding]::Default.GetString($pending.ToArray());$pending.Clear();Send-Line $line;if($ReplayExisting -and (($blockStart+$j+1) -le $replayBoundary) -and $null -ne $client){Start-Sleep -Milliseconds $periodMs}}else{$pending.Add($buffer[$j])}}}}}finally{if($null -ne $fs){$fs.Dispose()}}");
+            b.AppendLine("    catch{Write-Warning $_.Exception.Message}; Start-Sleep -Milliseconds 100");
+            b.AppendLine("  }");
+            b.AppendLine("} finally { if($null -ne $client){$client.Close()};$listener.Stop();Write-Host '桥接已停止。' }");
+            return b.ToString();
+        }
+
+        private static string Ps(string value) { return (value ?? String.Empty).Replace("'", "''"); }
+        private static string JoinInts(int[] values)
+        {
+            var result = new string[values == null ? 0 : values.Length];
+            for (int i = 0; i < result.Length; i++) result[i] = values[i].ToString(CultureInfo.InvariantCulture);
+            return String.Join(",", result);
+        }
+        private static string JoinHexIndexes(bool[] values)
+        {
+            var result = new List<string>();
+            if (values != null) for (int i = 0; i < values.Length; i++) if (values[i]) result.Add(i.ToString(CultureInfo.InvariantCulture));
+            return String.Join(",", result.ToArray());
         }
     }
 
@@ -719,6 +1273,68 @@ namespace GelGenerator
             if (start == s.Length) return false;
             for (int i = start; i < s.Length; i++) if (s[i] < '0' || s[i] > '9') return false;
             return true;
+        }
+
+        public static bool TryBuildFireWaterFrame(string line, int expectedColumns, int[] selectedColumns, bool[] hexColumns,
+            out string frame, out bool header, out bool mismatch, out string error)
+        {
+            frame = String.Empty; header = false; mismatch = false; error = null;
+            if (String.IsNullOrWhiteSpace(line)) { header = true; return false; }
+            List<List<string>> rows;
+            try { rows = ParseCsv(line + "\n"); }
+            catch (Exception ex) { error = "CSV 行解析失败：" + ex.Message; return false; }
+            if (rows.Count == 0) { header = true; return false; }
+            List<string> cells = rows[0];
+            for (int i = 0; i < cells.Count; i++) cells[i] = StripBridgePrefix(cells[i]).Trim().TrimStart('\uFEFF');
+            bool firstNumeric;
+            double first;
+            firstNumeric = Double.TryParse(cells.Count == 0 ? String.Empty : cells[0], NumberStyles.Float, CultureInfo.InvariantCulture, out first);
+            if (!firstNumeric)
+            {
+                header = true;
+                mismatch = cells.Count != expectedColumns;
+                return false;
+            }
+            if (cells.Count != expectedColumns)
+            {
+                mismatch = true;
+                error = "数据列数错误：期望 " + expectedColumns + " 列，实际 " + cells.Count + " 列。";
+                return false;
+            }
+            var output = new List<string>();
+            output.Add(NormalizeFireWaterNumber(cells[0], false));
+            foreach (int column in selectedColumns)
+            {
+                if (column <= 0 || column >= cells.Count) { error = "通道索引超出 CSV 列范围。"; return false; }
+                string normalized = NormalizeFireWaterNumber(cells[column], hexColumns != null && column < hexColumns.Length && hexColumns[column]);
+                if (normalized == null) { error = "非数值字段：第 " + (column + 1) + " 列，内容为“" + cells[column] + "”。"; return false; }
+                output.Add(normalized);
+            }
+            if (output[0] == null) { error = "样本序号不是有效数值。"; return false; }
+            frame = String.Join(",", output.ToArray());
+            return true;
+        }
+
+        private static string NormalizeFireWaterNumber(string value, bool hexadecimal)
+        {
+            if (hexadecimal)
+            {
+                ulong number;
+                string token = (value ?? String.Empty).Trim();
+                if (token.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) token = token.Substring(2);
+                return UInt64.TryParse(token, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out number)
+                    ? number.ToString(CultureInfo.InvariantCulture) : null;
+            }
+            double real;
+            return Double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out real) && !Double.IsNaN(real) && !Double.IsInfinity(real)
+                ? real.ToString("R", CultureInfo.InvariantCulture) : null;
+        }
+
+        private static string StripBridgePrefix(string value)
+        {
+            string cleaned = StripCcsPrefixes(value ?? String.Empty);
+            int colon = cleaned.LastIndexOf(':');
+            return colon >= 0 ? cleaned.Substring(colon + 1) : cleaned;
         }
 
         private static string ReadText(string path)
@@ -976,7 +1592,7 @@ namespace GelGenerator
             else if (type.StartsWith("enum32", StringComparison.Ordinal)) type = Enum32;
             if (String.IsNullOrWhiteSpace(format)) format = "十进制";
             if (format == "科学计数法") format = "十进制";
-            return new VariableItem { Name = item.Name, Expression = item.Expression, Type = type, OutputFormat = format };
+            return new VariableItem { Name = item.Name, Expression = item.Expression, Type = type, OutputFormat = format, SendToVofa = item.SendToVofa };
         }
 
         public static void ValidateTypeAndFormat(string type, string format)

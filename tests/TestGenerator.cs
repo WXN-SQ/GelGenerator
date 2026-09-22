@@ -2,6 +2,11 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Web.Script.Serialization;
 using GelGenerator;
 
 internal static class TestGenerator
@@ -47,9 +52,128 @@ internal static class TestGenerator
         AssertNotContains(gel, "\", ,,,,,");
         GelTemplate.ValidateGeneratedScript(gel, variables.Count);
         TestTypeValidationAndMigration();
+        TestBridgeParsingAndTemplate();
+        TestBridgeEndToEnd();
+        TestBridgeReplay();
+        TestBridgeConfigCompatibility();
         TestCsvConversion();
         Console.WriteLine("Generator tests passed.");
         return 0;
+    }
+
+    private static void TestBridgeReplay()
+    {
+        string path = Path.Combine(Path.GetTempPath(), "GelBridgeReplay-" + Guid.NewGuid().ToString("N") + ".csv");
+        File.WriteAllText(path, "sample,a\n0,10\n1,11\n", new UTF8Encoding(false));
+        var options = new BridgeOptions
+        {
+            CsvPath = path, Address = IPAddress.Loopback, Port = 0, ReplayExisting = true,
+            PeriodMs = 10, ExpectedColumns = 2, SelectedColumns = new[] { 1 }, HexColumns = new bool[2]
+        };
+        VofaBridgeService service = null;
+        TcpClient client = null;
+        try
+        {
+            service = new VofaBridgeService(options, delegate { });
+            service.Start();
+            Thread.Sleep(200);
+            client = new TcpClient();
+            client.Connect(IPAddress.Loopback, service.BoundPort);
+            client.GetStream().ReadTimeout = 3000;
+            using (var reader = new StreamReader(client.GetStream(), Encoding.ASCII, false, 1024, true))
+            {
+                if (reader.ReadLine() != "0,10" || reader.ReadLine() != "1,11")
+                    throw new Exception("Historical replay payload is incorrect.");
+            }
+        }
+        finally
+        {
+            if (client != null) client.Close();
+            if (service != null) service.Dispose();
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    private static void TestBridgeConfigCompatibility()
+    {
+        string legacyJson = "{\"CsvPath\":\"C:\\\\x.csv\",\"PeriodValue\":100,\"PeriodUnit\":\"ms\",\"GelPath\":\"C:\\\\x.gel\",\"Variables\":[{\"Name\":\"x\",\"Expression\":\"gX\",\"Type\":\"float32\",\"OutputFormat\":\"十进制\"}]}";
+        GeneratorConfig legacy = new JavaScriptSerializer().Deserialize<GeneratorConfig>(legacyJson);
+        if (legacy.VofaEnabled || legacy.VofaPort != 0 || legacy.Variables[0].SendToVofa)
+            throw new Exception("Legacy config must keep VOFA bridge disabled.");
+
+        var current = new GeneratorConfig
+        {
+            CsvPath = "x.csv", GelPath = "x.gel", PeriodValue = 100, PeriodUnit = "ms",
+            VofaEnabled = true, VofaAddress = "127.0.0.1", VofaPort = 1347, VofaReplayExisting = true,
+            Variables = new List<VariableItem> { new VariableItem { Name = "x", Expression = "gX", Type = "float32", OutputFormat = "十进制", SendToVofa = true } }
+        };
+        GeneratorConfig roundTrip = new JavaScriptSerializer().Deserialize<GeneratorConfig>(new JavaScriptSerializer().Serialize(current));
+        if (!roundTrip.VofaEnabled || roundTrip.VofaPort != 1347 || !roundTrip.Variables[0].SendToVofa)
+            throw new Exception("VOFA bridge config round-trip failed.");
+    }
+
+    private static void TestBridgeParsingAndTemplate()
+    {
+        string frame, error;
+        bool header, mismatch;
+        bool ok = CcsCsvConverter.TryBuildFireWaterFrame(
+            "C28xx_CPU1 : 0,C28xx_CPU1 : 3805.0,C28xx_CPU1 : 3956.0,C28xx_CPU1 : 29.734375,C28xx_CPU1 : 30.8984375",
+            5, new[] { 1, 4 }, new bool[5], out frame, out header, out mismatch, out error);
+        if (!ok || frame != "0,3805,30.8984375") throw new Exception("FireWater frame cleanup failed: " + error);
+
+        ok = CcsCsvConverter.TryBuildFireWaterFrame("CPU-X : 1,CPU-X : ff", 2, new[] { 1 }, new[] { false, true }, out frame, out header, out mismatch, out error);
+        if (!ok || frame != "1,255") throw new Exception("Hex FireWater conversion failed.");
+
+        ok = CcsCsvConverter.TryBuildFireWaterFrame("sample,a,b", 3, new[] { 1 }, new bool[3], out frame, out header, out mismatch, out error);
+        if (ok || !header || mismatch) throw new Exception("Bridge header recognition failed.");
+
+        var options = new BridgeOptions
+        {
+            CsvPath = "C:\\Data Folder\\log.csv", Address = IPAddress.Loopback, Port = 1347,
+            ReplayExisting = false, PeriodMs = 100, ExpectedColumns = 5,
+            SelectedColumns = new[] { 1, 4 }, HexColumns = new bool[5], ChannelNames = new[] { "sample", "a", "d" }
+        };
+        string ps = BridgePowerShellTemplate.Build(options);
+        AssertContains(ps, "$expectedColumns = 5");
+        AssertContains(ps, "$selectedColumns = @(1,4)");
+        AssertContains(ps, "127.0.0.1");
+    }
+
+    private static void TestBridgeEndToEnd()
+    {
+        string path = Path.Combine(Path.GetTempPath(), "GelBridgeTest-" + Guid.NewGuid().ToString("N") + ".csv");
+        File.WriteAllText(path, "sample,a,b\n", new UTF8Encoding(false));
+        var options = new BridgeOptions
+        {
+            CsvPath = path, Address = IPAddress.Loopback, Port = 0, ReplayExisting = false,
+            PeriodMs = 10, ExpectedColumns = 3, SelectedColumns = new[] { 1, 2 }, HexColumns = new bool[3]
+        };
+        VofaBridgeService service = null;
+        TcpClient client = null;
+        try
+        {
+            service = new VofaBridgeService(options, delegate { });
+            service.Start();
+            client = new TcpClient();
+            client.Connect(IPAddress.Loopback, service.BoundPort);
+            client.GetStream().ReadTimeout = 3000;
+            Thread.Sleep(300);
+            File.AppendAllText(path, "C28xx_CPU1 : 0,C28xx_CPU1 : 1.25", Encoding.ASCII);
+            Thread.Sleep(300);
+            if (client.Available != 0) throw new Exception("Bridge sent an incomplete CSV line.");
+            File.AppendAllText(path, ",C28xx_CPU1 : 2\n", Encoding.ASCII);
+            using (var reader = new StreamReader(client.GetStream(), Encoding.ASCII, false, 1024, true))
+            {
+                string received = reader.ReadLine();
+                if (received != "0,1.25,2") throw new Exception("Unexpected bridge payload: " + received);
+            }
+        }
+        finally
+        {
+            if (client != null) client.Close();
+            if (service != null) service.Dispose();
+            if (File.Exists(path)) File.Delete(path);
+        }
     }
 
     private static void TestTypeValidationAndMigration()

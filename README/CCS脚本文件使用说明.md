@@ -67,3 +67,6 @@ C28x `int/unsigned int` 通常为 16 位，`long/unsigned long` 为 32 位；`do
 - 多变量是 JTAG 顺序读取，不是原子快照。
 - GEL 没有通用 `try/catch/finally`，不能捕获所有非法地址、USB 或驱动故障。
 - 指针必须非空并指向有效内存；修改 GEL 后须在 GEL Files 中 Reload。
+- VOFA+桥接是 PC端文件监听和 TCP转发，不改变 GEL的纯 JTAG采集方式，也不会暂停目标 CPU。
+- VOFA+中应选择 TCP Client 和 FireWater，连接生成器显示的监听地址与端口。
+- FireWater不携带通道名称；使用生成器自动复制的列表，在 VOFA+中按同一顺序命名。

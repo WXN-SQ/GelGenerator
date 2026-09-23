@@ -6,7 +6,7 @@
 
 ## 变量配置
 
-每行分别填写 CSV 列名称、CCS/GEL 变量表达式、目标数据类型、输出格式。支持数组元素、多层结构体成员和有效指针成员：
+每行填写方向、CSV/VOFA 名称、CCS/GEL 变量表达式、目标数据类型和输出格式。方向含义：`output` 只采集，`input` 只允许写入且输出格式固定为“无”，`inout` 同时采集和写入并可选择十进制或十六进制。支持数组元素、多层结构体成员和有效指针成员：
 
 ```text
 gTelemetry.attitude.yaw
@@ -56,12 +56,15 @@ gDevicePtr->controller.feedback
 3. 添加变量，建议先在 CCS Expressions 验证表达式和实际数值。
 4. 单击“生成 GEL 文件”。
 
+“生成 GEL 文件”旁必须选择目标 CCS 版本：CCS 5.5、8.3、12.7.1 或 20.x。该全局选项同时决定 GEL 文件标识和输入桥接适配器类型；旧 JSON 配置默认迁移为 CCS 12.7.1，旧变量默认迁移为 `output`。
+
 ## VOFA+ 实时桥接
 
-在 GEL生成页勾选“启用 VOFA+桥接并生成独立脚本”后，变量表中的“发送到 VOFA+”列才可编辑，默认全部选中。生成 GEL 时会在相同目录生成：
+在 GEL生成页勾选“启用 VOFA+桥接并生成独立脚本”后，`output/inout` 行的“发送到 VOFA+”才可编辑；`input` 行不会进入 CSV。生成 GEL 时会在相同目录生成：
 
 ```text
 原GEL文件名_vofa_bridge.ps1
+原GEL文件名_ccs_input_bridge.js（存在 input/inout 时）
 ```
 
 同时会把 `sample` 和已选变量名称按通道顺序复制到剪贴板。FireWater帧只传输数字，通道名称仍需在 VOFA+中按复制顺序设置。
@@ -72,6 +75,8 @@ gDevicePtr->controller.feedback
 桥接程序：TCP Server
 监听地址：127.0.0.1
 端口：1347
+CCS 输入适配器端口：1349（只允许本机连接）
+CPU核匹配：C28xx_CPU1
 VOFA+：TCP Client
 协议引擎：FireWater
 ```
@@ -83,6 +88,30 @@ VOFA+：TCP Client
 3. 在生成器的桥接页选择“仅跟随新增数据”或“回放已有数据后继续跟随”。
 4. 点击“启动桥接”，再启动或继续 GEL采集。
 5. 点击“停止桥接”关闭监听和当前连接。
+
+### 通过 CCS Scripts 写入
+
+每个 `input/inout` 变量都会生成一个原生 GEL `dialog` 函数。加载 GEL 后进入 `Scripts → Target Variable Input`，选择对应的 `TargetInput_Set_序号_名称`，在弹窗中输入数值。函数写入后会立即回读，并在 CCS Console 输出 `[TargetInput] 名称=实际值`。此方式不需要启动 VOFA+、GelGenerator 桥接或 JavaScript 适配器。
+
+生成参数类型映射：int8/int16/enum16→`int`，uint8/uint16/bool→`unsigned int`，int32/enum32→`long`，uint32→`unsigned long`，float32→`float`，float64→`long double`。GEL 对话框自身不提供生成器级边界校验，输入者必须保证数值符合目标类型。
+
+### VOFA+ 反向写入
+
+1. 启动 GelGenerator 内置桥接。
+2. 在 CCS 中加载生成的 `_ccs_input_bridge.js`。CCS 5.5/8.3/12.7.1 使用 Legacy DSS Scripting Console，并先在 Debug 视图选中目标 CPU，使 `activeDS` 正确；CCS 20.x适配器会自动检测已有会话。若不存在，会调用`initScripting({inProcess:true})`、读取`listCores()`并按桥接页的“CPU核匹配”自动`openSession()`。
+3. 看到“CCS 写入适配器：已连接”后，手动勾选“允许 VOFA+ 反向写入目标变量”。该开关每次启动默认关闭。
+4. VOFA+只建立一个TCP Client连接波形端口1347并选择FireWater；命令控件通过同一个当前数据接口发送`SET,yaw_ref,12.5\n`。名称必须是`input/inout`白名单名称。
+5. 为避免ACK/ERR文本污染FireWater，写入结果不回传到VOFA+，而是在GelGenerator的最近命令、成功/失败计数和错误状态中显示。
+
+写入支持 int8/uint8/int16/uint16/int32/uint32、float32/float64、bool、enum16/enum32。整数、布尔和枚举可用十进制或带 `0x` 前缀的十六进制，例如 `SET,flags,0xFF`、`SET,count,0xFFFFFFFF`；浮点只接受十进制。生成器会拒绝整数小数、溢出值、无符号负数、NaN、Infinity，以及 bool 的非 0/1/0x0/0x1 值。ACK统一返回十进制回读值。未设置最小值/最大值；请在控制算法中自行保证指令范围。
+
+`inout`选择十六进制时，CSV按十六进制保存；VOFA+ FireWater波形仍转换为十进制数值，避免协议解析歧义。
+
+CCS 20.x适配器可安全重复加载：新脚本会停止旧Socket再建立连接，不会出现`Identifier 'socket' has already been declared`。GelGenerator尚未启动或重启时，适配器每1秒自动重连。写入先尝试无强制转换表达式，失败后才尝试带类型转换；错误区分为`NO_DEBUG_SESSION`、`ASSIGN_FAILED`和`READBACK_FAILED`，详细异常打印在CCS Scripting Console。
+
+CPU核匹配为固定下拉选项：`C28xx_CPU1`、`C28xx_CPU2`、`CPU1`、`CPU2`，默认`C28xx_CPU1`。适配器优先匹配路径最后一段的完整名称，并排除CLA核。匹配为0个或多个时拒绝写入并报告候选核。首次VOFA连接附带的`plot0`等无换行前缀会在找到完整`SET,`后安全丢弃，后续仍执行白名单与类型检查。
+
+波形和SET命令共用1347全双工TCP连接：GelGenerator只向该连接发送FireWater数字帧，VOFA+通过同一连接反向发送命令。`inout`变量可在后续采样中看到回读值；`input`变量的回读结果只显示在GelGenerator。独立PowerShell脚本保留原有CSV→VOFA+单向输出能力。
 
 “仅跟随新增数据”会跳过启动前的历史记录；“回放已有数据”会按 GEL采集周期发送历史完整行，再继续监听新数据。VOFA+断开期间不缓存数据，重新连接后只发送后续新行。
 
@@ -113,7 +142,7 @@ TI 官方 GEL 文档确认参数可接收目标符号/表达式；格式仅支�
 - <https://software-dl.ti.com/ccs/esd/documents/users_guide_12.7.0/gel/format.html>
 - <https://software-dl.ti.com/ccs/esd/documents/users_guide/gel/param.html>
 
-软件自动测试覆盖类型/格式校验、旧配置迁移、结构体/数组表达式、64 位与精度禁用、CSV 前缀清理与拆行重组、Excel 15 位整数边界。
+软件自动测试覆盖类型/格式校验、旧配置迁移、结构体/数组表达式、输入数值边界、uint32 最大值不截断、双 TCP 通道命令转发与回读、各代适配器模板、CSV 前缀清理与拆行重组、Excel 15 位整数边界。
 
 自动测试不能代替 CCS 实机验证。首次使用 `Uint32/unsigned long`、enum32、float64 或特定 typedef 时，应在具体 C28x、ABI、CCS 和仿真器组合上用边界值比较 Expressions 与 CSV。GEL `%u/%x` 没有长度修饰符，因此 32 位格式化结果必须以实机结果为准。
 

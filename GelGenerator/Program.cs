@@ -28,6 +28,7 @@ namespace GelGenerator
 
     public sealed class VariableItem
     {
+        public string Direction { get; set; }
         public string Name { get; set; }
         public string Expression { get; set; }
         public string Type { get; set; }
@@ -46,6 +47,9 @@ namespace GelGenerator
         public string VofaAddress { get; set; }
         public int VofaPort { get; set; }
         public bool VofaReplayExisting { get; set; }
+        public string CcsVersion { get; set; }
+        public bool VofaWriteEnabled { get; set; }
+        public string CcsCorePattern { get; set; }
     }
 
     public sealed class MainForm : Form
@@ -62,16 +66,23 @@ namespace GelGenerator
         private readonly TextBox txtXlsxDirectory = new TextBox();
         private readonly Label lblConvertStatus = new Label();
         private readonly CheckBox chkVofaEnabled = new CheckBox();
+        private readonly ComboBox cmbCcsVersion = new ComboBox();
+        private readonly CheckBox chkVofaWriteEnabled = new CheckBox();
         private readonly TextBox txtBridgeCsvPath = new TextBox();
         private readonly TextBox txtBridgeScriptPath = new TextBox();
         private readonly TextBox txtVofaAddress = new TextBox();
         private readonly NumericUpDown numVofaPort = new NumericUpDown();
+        private readonly TextBox txtCcsAdapterPort = new TextBox();
+        private readonly ComboBox cmbCcsCorePattern = new ComboBox();
         private readonly RadioButton radFollowNew = new RadioButton();
         private readonly RadioButton radReplay = new RadioButton();
         private readonly Button btnBridgeStart = new Button();
         private readonly Button btnBridgeStop = new Button();
         private readonly Label lblBridgeStatus = new Label();
         private readonly Label lblBridgeConnection = new Label();
+        private readonly Label lblAdapterConnection = new Label();
+        private readonly Label lblBridgeCommand = new Label();
+        private readonly Label lblTargetSession = new Label();
         private readonly Label lblBridgeCounters = new Label();
         private readonly Label lblBridgeError = new Label();
         private readonly TextBox txtBridgeChannels = new TextBox();
@@ -85,8 +96,11 @@ namespace GelGenerator
 
         internal static readonly string[] OutputFormats =
         {
-            "十进制", "十六进制"
+            "无", "十进制", "十六进制"
         };
+
+        internal static readonly string[] Directions = { "output", "input", "inout" };
+        internal static readonly string[] CcsVersions = { "CCS 5.5", "CCS 8.3", "CCS 12.7.1", "CCS 20.x" };
 
         public MainForm()
         {
@@ -114,17 +128,24 @@ namespace GelGenerator
                 "data_logger.csv");
             numPeriod.Value = 1000;
             cmbPeriodUnit.SelectedIndex = 0;
+            cmbCcsVersion.SelectedItem = "CCS 12.7.1";
             txtGelPath.Text = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
                 "data_logger.gel");
             txtVofaAddress.Text = "127.0.0.1";
             numVofaPort.Value = 1347;
+            cmbCcsCorePattern.Items.AddRange(new object[] { "C28xx_CPU1", "C28xx_CPU2", "CPU1", "CPU2" });
+            cmbCcsCorePattern.DropDownStyle = ComboBoxStyle.DropDownList;
+            cmbCcsCorePattern.SelectedItem = "C28xx_CPU1";
+            numVofaPort.ValueChanged += delegate { UpdateAdapterPort(); };
             radFollowNew.Checked = true;
             txtCsvPath.TextChanged += delegate { SyncBridgePaths(); };
             txtGelPath.TextChanged += delegate { SyncBridgePaths(); };
             chkVofaEnabled.CheckedChanged += delegate { ApplyVofaEnabledState(true); };
+            chkVofaWriteEnabled.CheckedChanged += delegate { if (bridgeService != null) bridgeService.SetWriteEnabled(chkVofaWriteEnabled.Checked); };
             SyncBridgePaths();
             ApplyVofaEnabledState(false);
+            UpdateAdapterPort();
         }
 
         private void BuildGeneratorUi(Control parent)
@@ -209,6 +230,13 @@ namespace GelGenerator
                 Name = "NameColumn", HeaderText = "CSV 列名称", DataPropertyName = "Name",
                 AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, FillWeight = 30
             });
+            var directionColumn = new DataGridViewComboBoxColumn
+            {
+                Name = "DirectionColumn", HeaderText = "方向", DataPropertyName = "Direction",
+                Width = 82, FlatStyle = FlatStyle.Flat
+            };
+            directionColumn.Items.AddRange(Directions);
+            grid.Columns.Insert(0, directionColumn);
             grid.Columns.Add(new DataGridViewTextBoxColumn
             {
                 Name = "ExpressionColumn", HeaderText = "CCS/GEL 变量表达式", DataPropertyName = "Expression",
@@ -236,6 +264,7 @@ namespace GelGenerator
             grid.DefaultValuesNeeded += delegate(object sender, DataGridViewRowEventArgs e)
             {
                 e.Row.Cells["TypeColumn"].Value = "float32";
+                e.Row.Cells["DirectionColumn"].Value = "output";
                 e.Row.Cells["FormatColumn"].Value = "十进制";
                 e.Row.Cells["VofaColumn"].Value = chkVofaEnabled.Checked;
             };
@@ -245,13 +274,17 @@ namespace GelGenerator
             };
             grid.CurrentCellDirtyStateChanged += delegate
             {
-                if (grid.IsCurrentCellDirty && grid.CurrentCell != null && grid.CurrentCell.OwningColumn.Name == "VofaColumn")
+                if (grid.IsCurrentCellDirty && grid.CurrentCell != null &&
+                    (grid.CurrentCell.OwningColumn.Name == "VofaColumn" || grid.CurrentCell.OwningColumn.Name == "DirectionColumn"))
                     grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
             };
             grid.CellValueChanged += delegate(object sender, DataGridViewCellEventArgs e)
             {
-                if (e.RowIndex >= 0 && e.ColumnIndex >= 0 && grid.Columns[e.ColumnIndex].Name == "VofaColumn")
+                if (e.RowIndex >= 0 && e.ColumnIndex >= 0)
+                {
+                    if (grid.Columns[e.ColumnIndex].Name == "DirectionColumn") ApplyDirectionState(e.RowIndex);
                     RefreshBridgeChannels();
+                }
             };
             grid.CellEndEdit += delegate { RefreshBridgeChannels(); };
             grid.RowsRemoved += delegate { RefreshBridgeChannels(); };
@@ -267,8 +300,10 @@ namespace GelGenerator
             rowButtons.Controls.Add(ButtonFor("清空", delegate { ClearRows(); }));
             root.Controls.Add(rowButtons, 0, 3);
 
-            var bottom = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2 };
+            var bottom = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 4 };
             bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             var status = new StatusStrip { SizingGrip = false, Dock = DockStyle.Fill };
             statusLabel.Text = "就绪：请添加至少一个变量。";
@@ -278,7 +313,12 @@ namespace GelGenerator
             generate.AutoSize = true;
             generate.Font = new Font(Font, FontStyle.Bold);
             generate.Padding = new Padding(16, 5, 16, 5);
-            bottom.Controls.Add(generate, 1, 0);
+            cmbCcsVersion.DropDownStyle = ComboBoxStyle.DropDownList;
+            cmbCcsVersion.Items.AddRange(CcsVersions);
+            cmbCcsVersion.Width = 125;
+            bottom.Controls.Add(LabelFor("目标 CCS："), 1, 0);
+            bottom.Controls.Add(cmbCcsVersion, 2, 0);
+            bottom.Controls.Add(generate, 3, 0);
             root.Controls.Add(bottom, 0, 4);
         }
 
@@ -295,7 +335,7 @@ namespace GelGenerator
             var intro = new Label
             {
                 AutoSize = true,
-                Text = "监听 CCS/GEL 持续追加的 CSV，清除调试前缀，并通过 TCP Server 向 VOFA+ FireWater 实时发送。",
+                Text = "单连接双向桥接：同一 VOFA+ TCP Client 接收 FireWater 波形并发送 SET 命令；CCS 适配器通过本机独立端口写入目标。",
                 Padding = new Padding(0, 0, 0, 8)
             };
             root.Controls.Add(intro, 0, 0);
@@ -316,12 +356,21 @@ namespace GelGenerator
             settings.Controls.Add(LabelFor("端口："), 2, 2);
             numVofaPort.Minimum = 1; numVofaPort.Maximum = 65535; numVofaPort.Width = 100;
             settings.Controls.Add(numVofaPort, 3, 2);
+            settings.Controls.Add(LabelFor("CCS适配器端口："), 0, 3);
+            txtCcsAdapterPort.ReadOnly = true; txtCcsAdapterPort.Width = 100;
+            settings.Controls.Add(txtCcsAdapterPort, 1, 3);
+            settings.Controls.Add(LabelFor("CPU核匹配："), 0, 4);
+            cmbCcsCorePattern.Width = 180;
+            settings.Controls.Add(cmbCcsCorePattern, 1, 4); settings.SetColumnSpan(cmbCcsCorePattern, 3);
             radFollowNew.Text = "仅跟随新增数据"; radFollowNew.AutoSize = true;
             radReplay.Text = "回放已有数据后继续跟随"; radReplay.AutoSize = true;
             var modes = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
             modes.Controls.Add(radFollowNew); modes.Controls.Add(radReplay);
-            settings.Controls.Add(LabelFor("启动模式："), 0, 3);
-            settings.Controls.Add(modes, 1, 3); settings.SetColumnSpan(modes, 3);
+            settings.Controls.Add(LabelFor("启动模式："), 0, 5);
+            settings.Controls.Add(modes, 1, 5); settings.SetColumnSpan(modes, 3);
+            chkVofaWriteEnabled.Text = "允许 VOFA+ 反向写入目标变量（默认关闭）";
+            chkVofaWriteEnabled.AutoSize = true;
+            settings.Controls.Add(chkVofaWriteEnabled, 1, 6); settings.SetColumnSpan(chkVofaWriteEnabled, 3);
             root.Controls.Add(settings, 0, 1);
 
             txtBridgeChannels.Dock = DockStyle.Fill;
@@ -333,11 +382,20 @@ namespace GelGenerator
 
             var state = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 1 };
             lblBridgeStatus.Text = "状态：未启用 VOFA+ 桥接。";
-            lblBridgeConnection.Text = "连接：未监听";
+            lblBridgeConnection.Text = "VOFA+ 波形连接：未监听";
+            lblAdapterConnection.Text = "CCS 写入适配器：未连接";
+            lblBridgeCommand.Text = "最近命令：无";
+            lblTargetSession.Text = "CCS 目标会话：未就绪";
             lblBridgeCounters.Text = "已发送：0；跳过：0";
             lblBridgeError.Text = "最近错误：无";
-            lblBridgeError.AutoSize = true;
-            state.Controls.Add(lblBridgeStatus); state.Controls.Add(lblBridgeConnection);
+            Label[] bridgeLabels = { lblBridgeStatus, lblBridgeConnection, lblAdapterConnection, lblTargetSession, lblBridgeCommand, lblBridgeCounters, lblBridgeError };
+            foreach (Label label in bridgeLabels)
+            {
+                label.AutoSize = true;
+                label.Dock = DockStyle.Fill;
+                label.Margin = new Padding(0, 2, 0, 2);
+            }
+            state.Controls.Add(lblBridgeStatus); state.Controls.Add(lblBridgeConnection); state.Controls.Add(lblAdapterConnection); state.Controls.Add(lblTargetSession); state.Controls.Add(lblBridgeCommand);
             state.Controls.Add(lblBridgeCounters); state.Controls.Add(lblBridgeError);
             root.Controls.Add(state, 0, 3);
 
@@ -347,6 +405,8 @@ namespace GelGenerator
             btnBridgeStart.Text = "启动桥接"; btnBridgeStart.AutoSize = true;
             btnBridgeStart.Font = new Font(Font, FontStyle.Bold);
             btnBridgeStart.Click += delegate { StartBridge(); };
+            var copyStatus = ButtonFor("复制状态信息", delegate { CopyBridgeStatus(); });
+            buttons.Controls.Add(copyStatus);
             buttons.Controls.Add(btnBridgeStop); buttons.Controls.Add(btnBridgeStart);
             root.Controls.Add(buttons, 0, 4);
         }
@@ -601,36 +661,78 @@ namespace GelGenerator
                     if (!row.IsNewRow) row.Cells["VofaColumn"].Value = enabled;
             }
             grid.Columns["VofaColumn"].ReadOnly = !enabled;
+            foreach (DataGridViewRow row in grid.Rows) if (!row.IsNewRow) ApplyDirectionState(row.Index);
             txtVofaAddress.Enabled = enabled;
             numVofaPort.Enabled = enabled;
+            cmbCcsCorePattern.Enabled = enabled;
             radFollowNew.Enabled = enabled;
             radReplay.Enabled = enabled;
+            chkVofaWriteEnabled.Enabled = enabled;
+            if (!enabled) chkVofaWriteEnabled.Checked = false;
             btnBridgeStart.Enabled = enabled && bridgeService == null;
             if (!enabled && bridgeService != null) StopBridge();
             lblBridgeStatus.Text = enabled ? "状态：已启用，等待启动。" : "状态：未启用 VOFA+ 桥接；请先在 GEL 脚本生成页启用。";
             RefreshBridgeChannels();
         }
 
+        private int AdapterPort()
+        {
+            int wave = Decimal.ToInt32(numVofaPort.Value);
+            for (int offset = 2; offset <= 65535; offset++)
+            {
+                int value = ((wave - 1 + offset) % 65535) + 1;
+                if (value != wave) return value;
+            }
+            throw new InvalidOperationException("无法分配 CCS 适配器端口。");
+        }
+
+        private void UpdateAdapterPort()
+        {
+            try { txtCcsAdapterPort.Text = AdapterPort().ToString(CultureInfo.InvariantCulture); }
+            catch { txtCcsAdapterPort.Text = String.Empty; }
+        }
+
         private void RefreshBridgeChannels()
         {
             var names = new List<string> { "sample" };
+            var inputs = new List<string>();
             foreach (DataGridViewRow row in grid.Rows)
             {
                 if (row.IsNewRow) continue;
                 bool selected = false;
                 try { selected = Convert.ToBoolean(row.Cells["VofaColumn"].Value ?? false, CultureInfo.InvariantCulture); }
                 catch { }
-                if (!selected) continue;
                 string name = CellText(row, "NameColumn");
-                if (!String.IsNullOrWhiteSpace(name)) names.Add(name);
+                string direction = CellText(row, "DirectionColumn");
+                if (selected && direction != "input" && !String.IsNullOrWhiteSpace(name)) names.Add(name);
+                if ((direction == "input" || direction == "inout") && !String.IsNullOrWhiteSpace(name)) inputs.Add(name);
             }
-            txtBridgeChannels.Text = "当前通道顺序：" + Environment.NewLine + String.Join(Environment.NewLine, names.ToArray());
+            txtBridgeChannels.Text = "输出通道顺序：" + Environment.NewLine + String.Join(Environment.NewLine, names.ToArray()) +
+                Environment.NewLine + Environment.NewLine + "可写入变量（SET,名称,数值）：" + Environment.NewLine +
+                (inputs.Count == 0 ? "（无）" : String.Join(Environment.NewLine, inputs.ToArray()));
+        }
+
+        private void ApplyDirectionState(int rowIndex)
+        {
+            if (rowIndex < 0 || rowIndex >= grid.Rows.Count) return;
+            DataGridViewRow row = grid.Rows[rowIndex];
+            string direction = CellText(row, "DirectionColumn");
+            bool output = direction != "input";
+            row.Cells["FormatColumn"].ReadOnly = !output;
+            row.Cells["VofaColumn"].ReadOnly = !output || !chkVofaEnabled.Checked;
+            if (!output)
+            {
+                row.Cells["FormatColumn"].Value = "无";
+                row.Cells["VofaColumn"].Value = false;
+            }
+            else if (CellText(row, "FormatColumn") == "无" || String.IsNullOrWhiteSpace(CellText(row, "FormatColumn")))
+                row.Cells["FormatColumn"].Value = "十进制";
         }
 
         private void CopyChannelNames(IList<VariableItem> variables)
         {
             var names = new List<string> { "sample" };
-            foreach (VariableItem item in variables) if (item.SendToVofa) names.Add(item.Name);
+            foreach (VariableItem item in variables) if (item.SendToVofa && item.Direction != "input") names.Add(item.Name);
             try { Clipboard.SetText(String.Join(Environment.NewLine, names.ToArray())); }
             catch (Exception ex) { lblBridgeError.Text = "最近错误：通道名称复制失败：" + ex.Message; }
         }
@@ -640,31 +742,44 @@ namespace GelGenerator
             List<VariableItem> variables = ReadVariables(validate);
             var selected = new List<int>();
             var hexColumns = new bool[variables.Count + 1];
-            for (int i = 0; i < variables.Count; i++) if (variables[i].SendToVofa) selected.Add(i + 1);
-            for (int i = 0; i < variables.Count; i++) hexColumns[i + 1] = variables[i].OutputFormat == "十六进制";
+            int csvIndex = 1;
+            foreach (VariableItem item in variables)
+            {
+                if (item.Direction == "input") continue;
+                if (item.SendToVofa) selected.Add(csvIndex);
+                hexColumns[csvIndex] = item.OutputFormat == "十六进制";
+                csvIndex++;
+            }
+            VariableItem[] writable = variables.FindAll(delegate(VariableItem v) { return v.Direction == "input" || v.Direction == "inout"; }).ToArray();
             if (validate && !chkVofaEnabled.Checked) throw new InvalidOperationException("请先启用 VOFA+ 桥接。");
-            if (validate && selected.Count == 0) throw new InvalidOperationException("请至少选择一个发送到 VOFA+ 的变量。");
+            if (validate && selected.Count == 0 && writable.Length == 0) throw new InvalidOperationException("请至少选择一个输出通道或配置一个 input/inout 变量。");
             IPAddress address;
             if (!IPAddress.TryParse(txtVofaAddress.Text.Trim(), out address))
                 throw new InvalidOperationException("监听地址不是有效 IP 地址。");
+            if (String.IsNullOrWhiteSpace(cmbCcsCorePattern.Text)) throw new InvalidOperationException("CPU核匹配不能为空。");
+            int wavePort = Decimal.ToInt32(numVofaPort.Value);
             return new BridgeOptions
             {
                 CsvPath = txtCsvPath.Text,
                 Address = address,
-                Port = Decimal.ToInt32(numVofaPort.Value),
+                Port = wavePort,
                 ReplayExisting = radReplay.Checked,
                 PeriodMs = PeriodMilliseconds(),
-                ExpectedColumns = variables.Count + 1,
+                ExpectedColumns = csvIndex,
                 SelectedColumns = selected.ToArray(),
                 HexColumns = hexColumns,
-                ChannelNames = ChannelNames(variables)
+                ChannelNames = ChannelNames(variables),
+                ControlPort = AdapterPort(),
+                WriteEnabled = chkVofaWriteEnabled.Checked,
+                WritableVariables = writable
+                ,CorePattern = cmbCcsCorePattern.Text.Trim()
             };
         }
 
         private static string[] ChannelNames(IList<VariableItem> variables)
         {
             var names = new List<string> { "sample" };
-            foreach (VariableItem item in variables) if (item.SendToVofa) names.Add(item.Name);
+            foreach (VariableItem item in variables) if (item.SendToVofa && item.Direction != "input") names.Add(item.Name);
             return names.ToArray();
         }
 
@@ -694,18 +809,34 @@ namespace GelGenerator
             btnBridgeStop.Enabled = false;
             btnBridgeStart.Enabled = chkVofaEnabled.Checked;
             lblBridgeStatus.Text = "状态：桥接已停止。";
-            lblBridgeConnection.Text = "连接：未监听";
+            lblBridgeConnection.Text = "VOFA+ 波形连接：未监听";
+            lblAdapterConnection.Text = "CCS 写入适配器：未连接";
+            lblTargetSession.Text = "CCS 目标会话：未就绪";
         }
 
         private void BridgeStatusChanged(BridgeStatus status)
         {
             if (IsDisposed) return;
             if (InvokeRequired) { BeginInvoke(new Action<BridgeStatus>(BridgeStatusChanged), status); return; }
-            lblBridgeConnection.Text = "连接：" + (status.ClientConnected ? "VOFA+ 已连接" : "等待 VOFA+ 连接");
-            lblBridgeCounters.Text = "已发送：" + status.Sent + "；跳过：" + status.Skipped;
+            lblBridgeConnection.Text = "VOFA+ 波形连接：" + (status.ClientConnected ? "已连接" : "等待连接");
+            lblAdapterConnection.Text = "CCS 写入适配器：" + (status.AdapterConnected ? "已连接" : "等待连接");
+            lblTargetSession.Text = "CCS 目标会话：" + (String.IsNullOrWhiteSpace(status.TargetSessionStatus) ? "未就绪" : status.TargetSessionStatus);
+            lblBridgeCounters.Text = "已发送：" + status.Sent + "；跳过：" + status.Skipped + "；写入成功：" + status.Writes + "；写入失败：" + status.WriteFailures;
+            lblBridgeCommand.Text = "最近命令：" + (String.IsNullOrWhiteSpace(status.LastCommand) ? "无" : status.LastCommand + " → " + status.LastResponse);
             lblBridgeError.Text = "最近错误：" + (String.IsNullOrWhiteSpace(status.LastError) ? "无" : status.LastError);
             lblBridgeError.ForeColor = String.IsNullOrWhiteSpace(status.LastError) ? SystemColors.ControlText : Color.DarkRed;
             if (status.ColumnMismatch) lblBridgeStatus.Text = "状态：检测到列数变化，已暂停发送。";
+        }
+
+        private void CopyBridgeStatus()
+        {
+            string value = String.Join(Environment.NewLine, new[]
+            {
+                lblBridgeStatus.Text, lblBridgeConnection.Text,
+                lblAdapterConnection.Text, lblTargetSession.Text, lblBridgeCommand.Text, lblBridgeCounters.Text, lblBridgeError.Text
+            });
+            try { Clipboard.SetText(value); statusLabel.Text = "桥接状态已复制到剪贴板。"; }
+            catch (Exception ex) { MessageBox.Show(this, ex.Message, "复制状态失败", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
@@ -719,6 +850,7 @@ namespace GelGenerator
         private void AddRow()
         {
             int index = grid.Rows.Add();
+            grid.Rows[index].Cells["DirectionColumn"].Value = "output";
             grid.Rows[index].Cells["TypeColumn"].Value = "float32";
             grid.Rows[index].Cells["FormatColumn"].Value = "十进制";
             grid.Rows[index].Cells["VofaColumn"].Value = chkVofaEnabled.Checked;
@@ -765,6 +897,8 @@ namespace GelGenerator
             {
                 if (row.IsNewRow) continue;
                 logicalRow++;
+                string direction = CellText(row, "DirectionColumn");
+                if (String.IsNullOrWhiteSpace(direction)) direction = "output";
                 string name = CellText(row, "NameColumn");
                 string expression = CellText(row, "ExpressionColumn");
                 string type = CellText(row, "TypeColumn");
@@ -777,11 +911,17 @@ namespace GelGenerator
                     if (name.IndexOfAny(new[] { ',', '\r', '\n', '"' }) >= 0) throw new InvalidOperationException("CSV 列名称不能包含逗号、引号或换行：" + name);
                     if (!names.Add(name)) throw new InvalidOperationException("CSV 列名称重复：" + name);
                     if (Array.IndexOf(GelTypes, type) < 0) throw new InvalidOperationException("第 " + logicalRow + " 行的变量类型无效。");
-                    GelTemplate.ValidateTypeAndFormat(type, outputFormat);
+                    if (Array.IndexOf(Directions, direction) < 0) throw new InvalidOperationException("第 " + logicalRow + " 行的方向无效。");
+                    if (direction == "input")
+                    {
+                        if (outputFormat != "无") throw new InvalidOperationException("第 " + logicalRow + " 行为 input，输出格式必须为无。");
+                        GelTemplate.ValidateTypeAndFormat(type, "十进制");
+                    }
+                    else GelTemplate.ValidateTypeAndFormat(type, outputFormat);
                 }
-                list.Add(new VariableItem { Name = name, Expression = expression, Type = type, OutputFormat = outputFormat, SendToVofa = sendToVofa });
+                list.Add(new VariableItem { Direction = direction, Name = name, Expression = expression, Type = type, OutputFormat = outputFormat, SendToVofa = sendToVofa && direction != "input" });
             }
-            if (validate && list.Count == 0) throw new InvalidOperationException("请至少添加一个采集变量。");
+            if (validate && list.Count == 0) throw new InvalidOperationException("请至少添加一个变量。");
             return list;
         }
 
@@ -820,16 +960,24 @@ namespace GelGenerator
                 List<VariableItem> variables = ReadVariables(true);
                 int period = PeriodMilliseconds();
                 BridgeOptions bridgeOptions = chkVofaEnabled.Checked ? CurrentBridgeOptions(true) : null;
-                string script = GelTemplate.Build(txtCsvPath.Text, period, variables);
-                GelTemplate.ValidateGeneratedScript(script, variables.Count);
+                List<VariableItem> outputVariables = variables.FindAll(delegate(VariableItem v) { return v.Direction != "input"; });
+                List<VariableItem> writableVariables = variables.FindAll(delegate(VariableItem v) { return v.Direction == "input" || v.Direction == "inout"; });
+                string script = GelTemplate.Build(txtCsvPath.Text, period, outputVariables, cmbCcsVersion.Text, writableVariables);
+                GelTemplate.ValidateGeneratedScript(script, outputVariables.Count);
                 File.WriteAllText(txtGelPath.Text, script, new UTF8Encoding(false));
                 string extra = String.Empty;
                 if (chkVofaEnabled.Checked)
                 {
                     string bridgePath = BridgeScriptPath(txtGelPath.Text);
                     File.WriteAllText(bridgePath, BridgePowerShellTemplate.Build(bridgeOptions), new UTF8Encoding(true));
+                    if (bridgeOptions.WritableVariables.Length > 0)
+                    {
+                        string adapterPath = Path.Combine(Path.GetDirectoryName(txtGelPath.Text), Path.GetFileNameWithoutExtension(txtGelPath.Text) + "_ccs_input_bridge.js");
+                        File.WriteAllText(adapterPath, CcsInputAdapterTemplate.Build(cmbCcsVersion.Text, bridgeOptions), new UTF8Encoding(false));
+                        extra += "\nCCS 输入适配器：\n" + adapterPath;
+                    }
                     CopyChannelNames(variables);
-                    extra = "\nVOFA+ 桥接脚本：\n" + bridgePath + "\n\n通道名称已复制到剪贴板。";
+                    extra = "\nVOFA+ 桥接脚本：\n" + bridgePath + extra + "\n\n通道名称已复制到剪贴板。";
                 }
                 statusLabel.Text = "生成成功：" + txtGelPath.Text;
                 MessageBox.Show(this, "GEL 文件生成成功：\n" + txtGelPath.Text + extra, "完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -855,6 +1003,9 @@ namespace GelGenerator
                 VofaAddress = txtVofaAddress.Text,
                 VofaPort = Decimal.ToInt32(numVofaPort.Value),
                 VofaReplayExisting = radReplay.Checked
+                ,CcsVersion = cmbCcsVersion.Text
+                ,VofaWriteEnabled = chkVofaWriteEnabled.Checked
+                ,CcsCorePattern = cmbCcsCorePattern.Text
             };
         }
 
@@ -895,13 +1046,17 @@ namespace GelGenerator
                     radReplay.Checked = config.VofaReplayExisting;
                     radFollowNew.Checked = !config.VofaReplayExisting;
                     chkVofaEnabled.Checked = config.VofaEnabled;
+                    cmbCcsVersion.SelectedItem = Array.IndexOf(CcsVersions, config.CcsVersion) >= 0 ? config.CcsVersion : "CCS 12.7.1";
+                    chkVofaWriteEnabled.Checked = config.VofaEnabled && config.VofaWriteEnabled;
+                    string core = Array.IndexOf(new[] { "C28xx_CPU1", "C28xx_CPU2", "CPU1", "CPU2" }, config.CcsCorePattern) >= 0 ? config.CcsCorePattern : "C28xx_CPU1";
+                    cmbCcsCorePattern.SelectedItem = core;
                     grid.Rows.Clear();
                     if (config.Variables != null)
                     {
                         foreach (VariableItem item in config.Variables)
                         {
                             VariableItem migrated = GelTemplate.MigrateLegacy(item);
-                            grid.Rows.Add(migrated.Name, migrated.Expression, migrated.Type, migrated.OutputFormat, config.VofaEnabled && item.SendToVofa);
+                            grid.Rows.Add(migrated.Direction, migrated.Name, migrated.Expression, migrated.Type, migrated.OutputFormat, config.VofaEnabled && item.SendToVofa);
                         }
                     }
                     ApplyVofaEnabledState(false);
@@ -923,6 +1078,10 @@ namespace GelGenerator
         public int[] SelectedColumns;
         public bool[] HexColumns;
         public string[] ChannelNames;
+        public int ControlPort;
+        public bool WriteEnabled;
+        public VariableItem[] WritableVariables;
+        public string CorePattern;
     }
 
     internal sealed class BridgeStatus
@@ -932,6 +1091,12 @@ namespace GelGenerator
         public long Skipped;
         public string LastError;
         public bool ColumnMismatch;
+        public bool AdapterConnected;
+        public long Writes;
+        public long WriteFailures;
+        public string LastCommand;
+        public string LastResponse;
+        public string TargetSessionStatus;
     }
 
     internal sealed class VofaBridgeService : IDisposable
@@ -942,11 +1107,20 @@ namespace GelGenerator
         private readonly object sync = new object();
         private TcpListener listener;
         private TcpClient client;
+        private TcpListener controlListener;
+        private TcpClient adapterClient;
+        private readonly StringBuilder vofaCommands = new StringBuilder();
         private Thread worker;
         private long sent;
         private long skipped;
         private string lastError;
         private bool columnMismatch;
+        private long writes;
+        private long writeFailures;
+        private string lastCommand;
+        private string lastResponse;
+        private string targetSessionStatus;
+        private readonly StringBuilder adapterMessages = new StringBuilder();
 
         public VofaBridgeService(BridgeOptions options, Action<BridgeStatus> report)
         {
@@ -958,12 +1132,21 @@ namespace GelGenerator
         {
             listener = new TcpListener(options.Address, options.Port);
             listener.Start(1);
+            controlListener = new TcpListener(IPAddress.Loopback, options.ControlPort);
+            controlListener.Start(1);
             worker = new Thread(Run) { IsBackground = true, Name = "VOFA CSV Bridge" };
             worker.Start();
             Publish();
         }
 
+        public void SetWriteEnabled(bool enabled)
+        {
+            options.WriteEnabled = enabled;
+            Publish();
+        }
+
         public int BoundPort { get { return listener == null ? 0 : ((IPEndPoint)listener.LocalEndpoint).Port; } }
+        public int BoundControlPort { get { return controlListener == null ? 0 : ((IPEndPoint)controlListener.LocalEndpoint).Port; } }
 
         private void Run()
         {
@@ -977,6 +1160,9 @@ namespace GelGenerator
                 try
                 {
                     AcceptClientIfAvailable();
+                    AcceptAdapterIfAvailable();
+                    PollAdapterMessages();
+                    PollVofaCommands();
                     if (options.ReplayExisting && !initialized && !HasClient()) continue;
                     if (!File.Exists(options.CsvPath)) { SetError("等待 CSV 文件出现：" + options.CsvPath, false); continue; }
                     using (var stream = new FileStream(options.CsvPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
@@ -1046,6 +1232,121 @@ namespace GelGenerator
             lock (sync) return client != null && client.Connected;
         }
 
+        private void AcceptAdapterIfAvailable()
+        {
+            if (controlListener == null || !controlListener.Pending()) return;
+            TcpClient next = controlListener.AcceptTcpClient(); next.NoDelay = true;
+            lock (sync)
+            {
+                if (adapterClient != null) try { adapterClient.Close(); } catch { }
+                adapterClient = next;
+                adapterMessages.Length = 0;
+                targetSessionStatus = "正在初始化";
+            }
+            Publish();
+        }
+
+        private void PollAdapterMessages()
+        {
+            TcpClient adapter; lock (sync) adapter = adapterClient;
+            if (adapter == null || !adapter.Connected) return;
+            NetworkStream stream = adapter.GetStream();
+            if (!stream.DataAvailable) return;
+            byte[] buffer = new byte[2048]; int count = stream.Read(buffer, 0, buffer.Length);
+            if (count <= 0) return;
+            adapterMessages.Append(Encoding.UTF8.GetString(buffer, 0, count));
+            string line;
+            while (TryTakeAdapterLine(out line)) HandleAdapterStatus(line);
+        }
+
+        private bool TryTakeAdapterLine(out string line)
+        {
+            string text = adapterMessages.ToString(); int newline = text.IndexOf('\n');
+            if (newline < 0) { line = null; return false; }
+            line = text.Substring(0, newline).TrimEnd('\r').Trim();
+            adapterMessages.Remove(0, newline + 1); return true;
+        }
+
+        private bool HandleAdapterStatus(string line)
+        {
+            if (!line.StartsWith("STATUS,", StringComparison.OrdinalIgnoreCase)) return false;
+            string[] parts = line.Split(new[] { ',' }, 3);
+            if (parts.Length >= 3 && String.Equals(parts[1], "READY", StringComparison.OrdinalIgnoreCase)) targetSessionStatus = parts[2] + "，已就绪";
+            else if (parts.Length >= 3) targetSessionStatus = parts[2];
+            else targetSessionStatus = line;
+            Publish(); return true;
+        }
+
+        private void PollVofaCommands()
+        {
+            TcpClient current;
+            lock (sync) current = client;
+            if (current == null || !current.Connected || !current.GetStream().DataAvailable) return;
+            byte[] buffer = new byte[4096];
+            int count = current.GetStream().Read(buffer, 0, buffer.Length);
+            if (count <= 0) return;
+            vofaCommands.Append(Encoding.ASCII.GetString(buffer, 0, count));
+            while (true)
+            {
+                string all = vofaCommands.ToString(); int newline = all.IndexOf('\n');
+                if (newline < 0) break;
+                string command = all.Substring(0, newline).TrimEnd('\r').Trim();
+                vofaCommands.Remove(0, newline + 1);
+                if (command.Length > 0) HandleWriteCommand(command, current);
+            }
+        }
+
+        private void HandleWriteCommand(string command, TcpClient vofa)
+        {
+            int setStart = command.IndexOf("SET,", StringComparison.OrdinalIgnoreCase);
+            if (setStart > 0) command = command.Substring(setStart);
+            string[] parts = command.Split(',');
+            if (parts.Length != 3 || !String.Equals(parts[0].Trim(), "SET", StringComparison.OrdinalIgnoreCase))
+            { CompleteWrite(vofa, command, "ERR,COMMAND,EXPECTED_SET_NAME_VALUE", false); return; }
+            string name = parts[1].Trim(); string value = parts[2].Trim();
+            if (!options.WriteEnabled) { CompleteWrite(vofa, command, "ERR," + name + ",WRITE_DISABLED", false); return; }
+            VariableItem item = null;
+            foreach (VariableItem candidate in options.WritableVariables ?? new VariableItem[0])
+                if (String.Equals(candidate.Name, name, StringComparison.OrdinalIgnoreCase)) { item = candidate; break; }
+            if (item == null) { CompleteWrite(vofa, command, "ERR," + name + ",UNKNOWN_VARIABLE", false); return; }
+            string normalized;
+            if (!InputValueValidator.TryNormalize(item.Type, value, out normalized))
+            { CompleteWrite(vofa, command, "ERR," + name + ",INVALID_VALUE", false); return; }
+            TcpClient adapter;
+            lock (sync) adapter = adapterClient;
+            if (adapter == null || !adapter.Connected) { CompleteWrite(vofa, command, "ERR," + name + ",CCS_NOT_CONNECTED", false); return; }
+            try
+            {
+                NetworkStream stream = adapter.GetStream();
+                byte[] request = Encoding.UTF8.GetBytes("SET," + name + "," + normalized + "\n");
+                stream.Write(request, 0, request.Length); stream.ReadTimeout = 3000;
+                string reply = null;
+                while (reply == null)
+                {
+                    string line;
+                    if (!TryTakeAdapterLine(out line))
+                    {
+                        int ch = stream.ReadByte(); if (ch < 0) throw new IOException("CCS adapter closed.");
+                        adapterMessages.Append((char)ch); continue;
+                    }
+                    if (!HandleAdapterStatus(line)) reply = line;
+                }
+                CompleteWrite(vofa, command, reply, reply.StartsWith("ACK,", StringComparison.OrdinalIgnoreCase));
+            }
+            catch (Exception ex)
+            {
+                lock (sync) { if (adapterClient != null) try { adapterClient.Close(); } catch { } adapterClient = null; }
+                CompleteWrite(vofa, command, "ERR," + name + ",CCS_IO_ERROR", false); SetError("CCS 写入失败：" + ex.Message, false);
+            }
+        }
+
+        private void CompleteWrite(TcpClient target, string command, string response, bool success)
+        {
+            lastCommand = command; lastResponse = response;
+            if (success) writes++; else writeFailures++;
+            Publish();
+        }
+
         private void ProcessLine(string line, bool historical)
         {
             string frame, error;
@@ -1107,7 +1408,8 @@ namespace GelGenerator
             if (report == null) return;
             TcpClient current;
             lock (sync) current = client;
-            report(new BridgeStatus { ClientConnected = current != null && current.Connected, Sent = sent, Skipped = skipped, LastError = lastError, ColumnMismatch = columnMismatch });
+            TcpClient adapter; lock (sync) adapter = adapterClient;
+            report(new BridgeStatus { ClientConnected = current != null && current.Connected, AdapterConnected = adapter != null && adapter.Connected, TargetSessionStatus = targetSessionStatus, Sent = sent, Skipped = skipped, Writes = writes, WriteFailures = writeFailures, LastCommand = lastCommand, LastResponse = lastResponse, LastError = lastError, ColumnMismatch = columnMismatch });
         }
 
         public void Dispose()
@@ -1115,6 +1417,8 @@ namespace GelGenerator
             stopEvent.Set();
             CloseClient();
             if (listener != null) try { listener.Stop(); } catch { }
+            if (controlListener != null) try { controlListener.Stop(); } catch { }
+            lock (sync) { if (adapterClient != null) try { adapterClient.Close(); } catch { } adapterClient = null; }
             if (worker != null && worker.IsAlive) worker.Join(2000);
             stopEvent.Dispose();
         }
@@ -1174,6 +1478,165 @@ namespace GelGenerator
             if (values != null) for (int i = 0; i < values.Length; i++) if (values[i]) result.Add(i.ToString(CultureInfo.InvariantCulture));
             return String.Join(",", result.ToArray());
         }
+    }
+
+    internal static class InputValueValidator
+    {
+        public static bool TryNormalize(string type, string value, out string normalized)
+        {
+            normalized = null;
+            if (String.IsNullOrWhiteSpace(value)) return false;
+            value = value.Trim();
+            if (type == "float32" || type == "float64")
+            {
+                double number;
+                if (!Double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out number) || Double.IsNaN(number) || Double.IsInfinity(number)) return false;
+                if (type == "float32" && (number > Single.MaxValue || number < -Single.MaxValue)) return false;
+                normalized = number.ToString("R", CultureInfo.InvariantCulture); return true;
+            }
+            long signed; ulong unsigned;
+            if (type == "bool")
+            {
+                if (!TryUnsignedInteger(value, out unsigned) || unsigned > 1UL) return false;
+                normalized = unsigned.ToString(CultureInfo.InvariantCulture); return true;
+            }
+            bool isUnsigned = type == "uint8" || type == "uint16" || type == "uint32";
+            if (isUnsigned)
+            {
+                if (!TryUnsignedInteger(value, out unsigned)) return false;
+                ulong max = type == "uint8" ? 255UL : type == "uint16" ? 65535UL : 4294967295UL;
+                if (unsigned > max) return false; normalized = unsigned.ToString(CultureInfo.InvariantCulture); return true;
+            }
+            if (!TrySignedInteger(value, out signed)) return false;
+            long min = type == "int8" ? -128L : (type == "int16" || type == "enum16") ? -32768L : -2147483648L;
+            long maxSigned = type == "int8" ? 127L : (type == "int16" || type == "enum16") ? 32767L : 2147483647L;
+            if (signed < min || signed > maxSigned) return false;
+            normalized = signed.ToString(CultureInfo.InvariantCulture); return true;
+        }
+
+        private static bool TryUnsignedInteger(string value, out ulong result)
+        {
+            result = 0;
+            string text = value.Trim();
+            if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                return text.Length > 2 && UInt64.TryParse(text.Substring(2), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out result);
+            return UInt64.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out result);
+        }
+
+        private static bool TrySignedInteger(string value, out long result)
+        {
+            result = 0;
+            string text = value.Trim();
+            bool negative = text.StartsWith("-", StringComparison.Ordinal);
+            bool positive = text.StartsWith("+", StringComparison.Ordinal);
+            string magnitude = (negative || positive) ? text.Substring(1) : text;
+            if (!magnitude.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                return Int64.TryParse(text, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out result);
+            ulong raw;
+            if (magnitude.Length <= 2 || !UInt64.TryParse(magnitude.Substring(2), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out raw)) return false;
+            if (negative)
+            {
+                if (raw > 2147483648UL) return false;
+                result = -(long)raw;
+            }
+            else
+            {
+                if (raw > Int64.MaxValue) return false;
+                result = (long)raw;
+            }
+            return true;
+        }
+    }
+
+    internal static class CcsInputAdapterTemplate
+    {
+        public static string Build(string ccsVersion, BridgeOptions options)
+        {
+            return ccsVersion == "CCS 20.x" ? Build20(options) : BuildLegacy(ccsVersion, options);
+        }
+
+        private static string BuildLegacy(string version, BridgeOptions options)
+        {
+            var b = new StringBuilder();
+            b.AppendLine("// " + version + " Legacy DSS 输入适配器；在 CCS Scripting Console 中加载。\n// 先在 Debug 视图选中目标 CPU，使 activeDS 指向正确会话。");
+            AppendLegacyMap(b, options.WritableVariables);
+            b.AppendLine("var socket = new java.net.Socket('127.0.0.1', " + options.ControlPort.ToString(CultureInfo.InvariantCulture) + ");");
+            b.AppendLine("var input = new java.io.BufferedReader(new java.io.InputStreamReader(socket.getInputStream(), 'UTF-8'));\nvar output = new java.io.PrintWriter(new java.io.OutputStreamWriter(socket.getOutputStream(), 'UTF-8'), true);");
+            b.AppendLine("while (true) { var line=input.readLine(); if(line==null) break; var p=String(line).split(','); var name=p.length==3?p[1]:''; try { if(p.length!=3 || p[0]!='SET' || !writable[name]) throw 'BAD_COMMAND'; var item=writable[name]; activeDS.expression.evaluate(item.expr+' = ('+item.cast+')('+p[2]+')'); var actual=activeDS.expression.evaluateToString(item.expr); output.println('ACK,'+name+','+String(actual).replace(/^\\s+|\\s+$/g,'')); } catch(e) { output.println('ERR,'+name+',CCS_EVALUATE_FAILED'); } }\nsocket.close();");
+            return b.ToString();
+        }
+
+        private static void AppendLegacyMap(StringBuilder b, VariableItem[] variables)
+        {
+            b.AppendLine("var writable = {};");
+            foreach (VariableItem v in variables ?? new VariableItem[0])
+                b.AppendLine("writable['" + Js(v.Name) + "']={expr:'" + Js(v.Expression) + "',cast:'" + Cast(v.Type) + "'};");
+        }
+
+        private static string Build20(BridgeOptions options)
+        {
+            var b = new StringBuilder();
+            b.AppendLine("// CCS 20.x 输入适配器：兼容新 Scripting(session) 与 Legacy DSS(activeDS)。");
+            b.AppendLine("(function () {");
+            b.AppendLine("  var root = (typeof globalThis !== 'undefined') ? globalThis : this;");
+            b.AppendLine("  var previous = root.__gelGeneratorInputBridge;");
+            b.AppendLine("  if (previous && typeof previous.stop === 'function') { try { previous.stop(); } catch (_) {} }");
+            b.AppendLine("  var netModule = require('net');");
+            b.AppendLine("  var writable = {};");
+            foreach (VariableItem v in options.WritableVariables ?? new VariableItem[0])
+                b.AppendLine("  writable['" + Js(v.Name) + "']={expr:'" + Js(v.Expression) + "',cast:'" + Cast(v.Type) + "'};");
+            b.AppendLine("  var corePattern = '" + Js(String.IsNullOrWhiteSpace(options.CorePattern) ? "C28xx_CPU1" : options.CorePattern) + "';");
+            b.AppendLine("  var state = { socket:null, timer:null, pending:'', stopped:false, writable:writable, debug:null, debugError:null };");
+            b.AppendLine("  function errorText(e) { return String(e && e.message ? e.message : e).replace(/[\\r\\n]+/g,' '); }");
+            b.AppendLine("  function establishDebugger() {");
+            b.AppendLine("    if (typeof session !== 'undefined' && session && session.expressions) return {kind:'modern',object:session,name:'session'};");
+            b.AppendLine("    if (root.__ggSession && root.__ggSession.expressions) return {kind:'modern',object:root.__ggSession,name:'__ggSession'};");
+            b.AppendLine("    if (typeof activeDS !== 'undefined' && activeDS && activeDS.expression) return {kind:'legacy',object:activeDS,name:'activeDS'};");
+            b.AppendLine("    var scripting = (typeof ds !== 'undefined' && ds && typeof ds.openSession === 'function') ? ds : root.__ggDs;");
+            b.AppendLine("    if (!scripting) { if (typeof initScripting !== 'function') throw new Error('initScripting不可用'); scripting=initScripting({inProcess:true}); root.__ggDs=scripting; }");
+            b.AppendLine("    var listed=scripting.listCores(), cores=(listed&&listed.cores)?listed.cores:[], pattern=corePattern.toLowerCase();");
+            b.AppendLine("    var exact=cores.filter(function(c){return String(c).split('/').pop().toLowerCase()===pattern;});");
+            b.AppendLine("    var matches=exact.length?exact:cores.filter(function(c){var s=String(c);return s.toLowerCase().indexOf(pattern)>=0&&!/_CLA(?:1|2)?$/i.test(s);});");
+            b.AppendLine("    if(matches.length!==1) throw new Error('CPU核匹配数量='+matches.length+'；pattern='+corePattern+'；cores='+cores.join('|'));");
+            b.AppendLine("    root.__ggSession=scripting.openSession(matches[0]); return {kind:'modern',object:root.__ggSession,name:String(matches[0])};");
+            b.AppendLine("  }");
+            b.AppendLine("  function ensureDebugger() { if(state.debug) return state.debug; try{state.debug=establishDebugger();state.debugError=null;return state.debug;}catch(e){state.debugError=errorText(e);return null;} }");
+            b.AppendLine("  function evaluate(context, expression) { return context.kind === 'modern' ? context.object.expressions.evaluate(expression) : context.object.expression.evaluate(expression); }");
+            b.AppendLine("  function readBack(context, expression) { return context.kind === 'modern' ? context.object.expressions.evaluate(expression) : context.object.expression.evaluateToString(expression); }");
+            b.AppendLine("  function send(text) { if (state.socket && !state.socket.destroyed) state.socket.write(text+'\\n'); }");
+            b.AppendLine("  function processCommand(line) {");
+            b.AppendLine("    var p=line.split(','); var name=p.length===3?p[1]:'';");
+            b.AppendLine("    if(p.length!==3 || p[0]!=='SET' || !writable[name]) { send('ERR,'+name+',BAD_COMMAND'); return; }");
+            b.AppendLine("    var item=writable[name], value=p[2], context=ensureDebugger();");
+            b.AppendLine("    if(!context) { console.error('[GelGenerator] '+name+'：目标会话未就绪：'+state.debugError); send('STATUS,ERROR,'+String(state.debugError).replace(/[\\r\\n,]+/g,' ')); send('ERR,'+name+',NO_DEBUG_SESSION'); return; }");
+            b.AppendLine("    var plain=item.expr+' = '+value, casted=item.expr+' = ('+item.cast+')('+value+')';");
+            b.AppendLine("    try { evaluate(context,plain); }");
+            b.AppendLine("    catch(first) { try { evaluate(context,casted); } catch(second) { console.error('[GelGenerator] '+name+' 赋值失败；plain='+errorText(first)+'；cast='+errorText(second)); send('ERR,'+name+',ASSIGN_FAILED'); return; } }");
+            b.AppendLine("    try { var actual=readBack(context,item.expr); send('ACK,'+name+','+String(actual).replace(/[\\r\\n,]+/g,' ')); }");
+            b.AppendLine("    catch(e) { console.error('[GelGenerator] '+name+' 回读失败：'+errorText(e)); send('ERR,'+name+',READBACK_FAILED'); }");
+            b.AppendLine("  }");
+            b.AppendLine("  function scheduleReconnect() { if(state.stopped || state.timer) return; state.timer=setTimeout(function(){state.timer=null;connect();},1000); }");
+            b.AppendLine("  function connect() {");
+            b.AppendLine("    if(state.stopped) return; if(state.socket){try{state.socket.removeAllListeners();state.socket.destroy();}catch(_){}} state.pending='';");
+            b.AppendLine("    var socket=netModule.createConnection({host:'127.0.0.1',port:" + options.ControlPort.ToString(CultureInfo.InvariantCulture) + "}); state.socket=socket;");
+            b.AppendLine("    socket.on('connect',function(){var context=ensureDebugger();if(context){console.log('[GelGenerator] 输入桥接已连接；目标会话='+context.name);send('STATUS,READY,'+String(context.name).replace(/[\\r\\n,]+/g,' '));}else{console.error('[GelGenerator] 目标会话初始化失败：'+state.debugError);send('STATUS,ERROR,'+String(state.debugError).replace(/[\\r\\n,]+/g,' '));}});");
+            b.AppendLine("    socket.on('data',function(data){state.pending+=data.toString('utf8');var n;while((n=state.pending.indexOf('\\n'))>=0){var line=state.pending.slice(0,n).replace(/\\r$/,'');state.pending=state.pending.slice(n+1);if(line)processCommand(line);}});");
+            b.AppendLine("    socket.on('error',function(e){console.error('[GelGenerator] 输入桥接连接错误：'+errorText(e));});");
+            b.AppendLine("    socket.on('close',function(){if(!state.stopped){console.log('[GelGenerator] 输入桥接已断开，1秒后重连');scheduleReconnect();}});");
+            b.AppendLine("  }");
+            b.AppendLine("  state.stop=function(){state.stopped=true;if(state.timer){clearTimeout(state.timer);state.timer=null;}if(state.socket){try{state.socket.removeAllListeners();state.socket.destroy();}catch(_){}}};");
+            b.AppendLine("  root.__gelGeneratorInputBridge=state; connect();");
+            b.AppendLine("})();");
+            return b.ToString();
+        }
+
+        private static string Cast(string type)
+        {
+            if (type == "float32") return "float"; if (type == "float64") return "double";
+            if (type == "uint32") return "unsigned long"; if (type == "int32" || type == "enum32") return "long";
+            if (type == "uint8" || type == "uint16" || type == "bool") return "unsigned int"; return "int";
+        }
+        private static string Js(string value) { return (value ?? String.Empty).Replace("\\", "\\\\").Replace("'", "\\'").Replace("\r", "").Replace("\n", ""); }
     }
 
     internal static class CcsCsvConverter
@@ -1567,7 +2030,7 @@ namespace GelGenerator
 
         public static VariableItem MigrateLegacy(VariableItem item)
         {
-            if (item == null) return new VariableItem { Type = Float32, OutputFormat = "十进制" };
+            if (item == null) return new VariableItem { Direction = "output", Type = Float32, OutputFormat = "十进制" };
             string type = item.Type ?? String.Empty;
             string format = item.OutputFormat;
             if (type.StartsWith("int64", StringComparison.Ordinal) || type.StartsWith("uint64", StringComparison.Ordinal))
@@ -1592,7 +2055,10 @@ namespace GelGenerator
             else if (type.StartsWith("enum32", StringComparison.Ordinal)) type = Enum32;
             if (String.IsNullOrWhiteSpace(format)) format = "十进制";
             if (format == "科学计数法") format = "十进制";
-            return new VariableItem { Name = item.Name, Expression = item.Expression, Type = type, OutputFormat = format, SendToVofa = item.SendToVofa };
+            string direction = Array.IndexOf(MainForm.Directions, item.Direction) >= 0 ? item.Direction : "output";
+            if (direction == "input") format = "无";
+            else if (format == "无") format = "十进制";
+            return new VariableItem { Direction = direction, Name = item.Name, Expression = item.Expression, Type = type, OutputFormat = format, SendToVofa = item.SendToVofa };
         }
 
         public static void ValidateTypeAndFormat(string type, string format)
@@ -1608,6 +2074,16 @@ namespace GelGenerator
 
         public static string Build(string csvPath, int periodMs, IList<VariableItem> variables)
         {
+            return Build(csvPath, periodMs, variables, "CCS 12.7.1");
+        }
+
+        public static string Build(string csvPath, int periodMs, IList<VariableItem> variables, string ccsVersion)
+        {
+            return Build(csvPath, periodMs, variables, ccsVersion, new VariableItem[0]);
+        }
+
+        public static string Build(string csvPath, int periodMs, IList<VariableItem> variables, string ccsVersion, IList<VariableItem> writableVariables)
+        {
             for (int i = 0; i < variables.Count; i++)
             {
                 VariableItem migrated = MigrateLegacy(variables[i]);
@@ -1617,7 +2093,7 @@ namespace GelGenerator
             }
             var b = new StringBuilder();
             b.AppendLine("/*****************************************************************************");
-            b.AppendLine(" * CCS 12.7.1 GEL/JTAG 低速数据采集脚本");
+            b.AppendLine(" * " + (String.IsNullOrWhiteSpace(ccsVersion) ? "CCS 12.7.1" : ccsVersion) + " GEL/JTAG 低速数据采集脚本");
             b.AppendLine(" * 由 CCS GEL 数据采集脚本生成器自动生成。");
             b.AppendLine(" * 仅适合几 Hz～几十 Hz，严禁用于 kHz 级高速控制环采集。");
             b.AppendLine(" ****************************************************************************/");
@@ -1634,7 +2110,7 @@ namespace GelGenerator
             b.AppendLine("DataLogger_WriteHeader()");
             b.AppendLine("{");
             b.AppendLine("    GEL_EnableFileOutput(DL_CSV_PATH, 0, 0);");
-            b.AppendLine("    GEL_TextOut(\"sample," + EscapeGelString(String.Join(",", Names(variables))) + "\\n\");");
+            b.AppendLine("    GEL_TextOut(\"sample" + (variables.Count == 0 ? String.Empty : "," + EscapeGelString(String.Join(",", Names(variables)))) + "\\n\");");
             b.AppendLine("    GEL_DisableFileOutput();");
             b.AppendLine("}");
             b.AppendLine();
@@ -1675,7 +2151,7 @@ namespace GelGenerator
                 b.AppendLine("    dl_v" + i + " = 'SYM'::" + variables[i].Expression + ";");
             b.AppendLine();
             b.AppendLine("    GEL_EnableFileOutput(DL_CSV_PATH, 1, 0);");
-            b.AppendLine("    GEL_TextOut(\"%d,\",,,,,'GEL'::__dl_sample_count);");
+            b.AppendLine("    GEL_TextOut(\"%d" + (variables.Count == 0 ? "\\n" : ",") + "\",,,,,'GEL'::__dl_sample_count);");
             for (int i = 0; i < variables.Count; i++)
             {
                 string suffix = i == variables.Count - 1 ? "\\n" : ",";
@@ -1727,6 +2203,23 @@ namespace GelGenerator
             b.AppendLine("    'GEL'::__dl_busy = 0;");
             b.AppendLine("    GEL_TextOut(\"[DataLogger] 已强制清理。\\n\");");
             b.AppendLine("}");
+            if (writableVariables != null && writableVariables.Count > 0)
+            {
+                b.AppendLine();
+                b.AppendLine("menuitem \"Target Variable Input\"");
+                for (int i = 0; i < writableVariables.Count; i++)
+                {
+                    VariableItem item = MigrateLegacy(writableVariables[i]);
+                    ValidateTypeAndFormat(item.Type, "十进制");
+                    string functionName = "TargetInput_Set_" + (i + 1).ToString(CultureInfo.InvariantCulture) + "_" + GelIdentifier(item.Name);
+                    b.AppendLine();
+                    b.AppendLine("dialog " + functionName + "(" + LocalType(item.Type) + " value)");
+                    b.AppendLine("{");
+                    b.AppendLine("    'SYM'::" + item.Expression + " = value;");
+                    b.AppendLine("    GEL_TextOut(\"[TargetInput] " + EscapeGelString(item.Name) + "=" + Format(item.Type, "十进制") + "\\n\",,,,,'SYM'::" + item.Expression + ");");
+                    b.AppendLine("}");
+                }
+            }
             return b.ToString();
         }
 
@@ -1736,7 +2229,8 @@ namespace GelGenerator
                 throw new InvalidOperationException("生成结果为空。");
             if (script.Contains("\", ,,,,,"))
                 throw new InvalidOperationException("生成结果包含错误的 GEL_TextOut 参数占位符。");
-            if (!script.Contains("GEL_TextOut(\"%d,\",,,,,'GEL'::__dl_sample_count);"))
+            if (!script.Contains("GEL_TextOut(\"%d,\",,,,,'GEL'::__dl_sample_count);") &&
+                !script.Contains("GEL_TextOut(\"%d\\n\",,,,,'GEL'::__dl_sample_count);"))
                 throw new InvalidOperationException("采样序号的 GEL_TextOut 参数位置不正确。");
 
             int valueOutputCount = 0;
@@ -1778,6 +2272,19 @@ namespace GelGenerator
         private static string EscapeGelString(string value)
         {
             return value.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", "").Replace("\n", "\\n");
+        }
+
+        private static string GelIdentifier(string value)
+        {
+            var b = new StringBuilder();
+            foreach (char ch in value ?? String.Empty)
+            {
+                if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_') b.Append(ch);
+                else b.Append('_');
+            }
+            if (b.Length == 0) b.Append("variable");
+            if (b[0] >= '0' && b[0] <= '9') b.Insert(0, '_');
+            return b.ToString();
         }
     }
 }

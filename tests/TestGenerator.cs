@@ -56,9 +56,86 @@ internal static class TestGenerator
         TestBridgeEndToEnd();
         TestBridgeReplay();
         TestBridgeConfigCompatibility();
+        TestInputBridge();
+        TestInputBridgeEndToEnd();
         TestCsvConversion();
         Console.WriteLine("Generator tests passed.");
         return 0;
+    }
+
+    private static void TestInputBridgeEndToEnd()
+    {
+        string path = Path.Combine(Path.GetTempPath(), "GelInputBridge-" + Guid.NewGuid().ToString("N") + ".csv");
+        File.WriteAllText(path, "sample,x\n", Encoding.ASCII);
+        var options = new BridgeOptions { CsvPath=path, Address=IPAddress.Loopback, Port=0, ControlPort=0, ReplayExisting=false,
+            PeriodMs=10, ExpectedColumns=2, SelectedColumns=new[]{1}, HexColumns=new bool[2], WriteEnabled=true,
+            WritableVariables=new[]{new VariableItem{Direction="input",Name="setpoint",Expression="gSetpoint",Type="uint32"}} };
+        VofaBridgeService service=null; TcpClient vofa=null; TcpClient adapter=null; Thread fake=null; BridgeStatus latest=null;
+        try {
+            service=new VofaBridgeService(options, delegate(BridgeStatus s){latest=s;}); service.Start();
+            adapter=new TcpClient(); adapter.Connect(IPAddress.Loopback, service.BoundControlPort);
+            TcpClient captured=adapter;
+            fake=new Thread(delegate(){byte[] status=Encoding.UTF8.GetBytes("STATUS,READY,C28xx_CPU1\n");captured.GetStream().Write(status,0,status.Length);var reader=new StreamReader(captured.GetStream(),Encoding.UTF8,false,1024,true);string request=reader.ReadLine();if(request!="SET,setpoint,4294967295")throw new Exception("Adapter request incorrect: "+request);byte[] reply=Encoding.ASCII.GetBytes("ACK,setpoint,4294967295\n");captured.GetStream().Write(reply,0,reply.Length);}); fake.Start();
+            vofa=new TcpClient(); vofa.Connect(IPAddress.Loopback,service.BoundPort); vofa.GetStream().ReadTimeout=3000;
+            byte[] command=Encoding.ASCII.GetBytes("plot0SET,setpoint,4294967295\n");vofa.GetStream().Write(command,0,command.Length);
+            DateTime deadline=DateTime.UtcNow.AddSeconds(3);while((latest==null||latest.Writes<1)&&DateTime.UtcNow<deadline)Thread.Sleep(20);
+            if(latest==null||latest.Writes!=1||latest.LastResponse!="ACK,setpoint,4294967295")throw new Exception("Single-connection command result was not recorded.");
+            if(vofa.Available!=0)throw new Exception("Text ACK polluted the FireWater connection.");
+            fake.Join(3000);
+            if(latest==null || latest.TargetSessionStatus!="C28xx_CPU1，已就绪")throw new Exception("Adapter target-session status was not reported.");
+        } finally { if(vofa!=null)vofa.Close();if(adapter!=null)adapter.Close();if(service!=null)service.Dispose();if(File.Exists(path))File.Delete(path); }
+    }
+
+    private static void TestInputBridge()
+    {
+        string value;
+        if (!InputValueValidator.TryNormalize("uint32", "4294967295", out value) || value != "4294967295")
+            throw new Exception("uint32 maximum was rejected or truncated.");
+        if (InputValueValidator.TryNormalize("uint32", "4294967296", out value)) throw new Exception("uint32 overflow accepted.");
+        if (!InputValueValidator.TryNormalize("int8", "-128", out value) || InputValueValidator.TryNormalize("int8", "128", out value))
+            throw new Exception("int8 boundary validation failed.");
+        if (InputValueValidator.TryNormalize("bool", "2", out value)) throw new Exception("invalid bool accepted.");
+        if (InputValueValidator.TryNormalize("float32", "NaN", out value)) throw new Exception("NaN accepted.");
+        if (!InputValueValidator.TryNormalize("uint32", "0xFFFFFFFF", out value) || value != "4294967295")
+            throw new Exception("uint32 hexadecimal maximum failed.");
+        if (InputValueValidator.TryNormalize("uint32", "0x100000000", out value)) throw new Exception("uint32 hexadecimal overflow accepted.");
+        if (!InputValueValidator.TryNormalize("int8", "-0x80", out value) || value != "-128") throw new Exception("signed hexadecimal input failed.");
+        if (InputValueValidator.TryNormalize("int8", "0xFF", out value)) throw new Exception("signed hexadecimal overflow accepted.");
+        if (!InputValueValidator.TryNormalize("bool", "0x1", out value) || InputValueValidator.TryNormalize("bool", "0x2", out value))
+            throw new Exception("hexadecimal bool validation failed.");
+        if (InputValueValidator.TryNormalize("float32", "0x10", out value)) throw new Exception("hexadecimal float accepted.");
+        var options = new BridgeOptions { ControlPort = 1348, CorePattern = "C28xx_CPU1", WritableVariables = new[] {
+            new VariableItem { Direction="input", Name="yaw_ref", Expression="gPositionControlObj[0].positionRef", Type="float32" },
+            new VariableItem { Direction="inout", Name="count", Expression="gCount", Type="uint32" }
+        }};
+        string legacy = CcsInputAdapterTemplate.Build("CCS 12.7.1", options);
+        AssertContains(legacy, "activeDS.expression.evaluate"); AssertContains(legacy, "gPositionControlObj[0].positionRef");
+        string modern = CcsInputAdapterTemplate.Build("CCS 20.x", options);
+        AssertContains(modern, "session.expressions"); AssertContains(modern, "activeDS.expression"); AssertContains(modern, "require('net')");
+        AssertContains(modern, "initScripting({inProcess:true})");
+        AssertContains(modern, "scripting.listCores()");
+        AssertContains(modern, "scripting.openSession(matches[0])");
+        AssertContains(modern, "C28xx_CPU1");
+        AssertContains(modern, "STATUS,READY");
+        AssertContains(modern, "root.__gelGeneratorInputBridge");
+        AssertContains(modern, "previous.stop()");
+        AssertContains(modern, "setTimeout(function(){state.timer=null;connect();},1000)");
+        AssertContains(modern, "var plain=item.expr+' = '+value");
+        AssertContains(modern, "casted=item.expr+' = ('+item.cast+')('+value+')'");
+        AssertContains(modern, "NO_DEBUG_SESSION");
+        AssertContains(modern, "ASSIGN_FAILED");
+        AssertContains(modern, "READBACK_FAILED");
+        AssertNotContains(modern, "const socket");
+        var allInput = new List<VariableItem>();
+        string gel = GelTemplate.Build("C:\\x.csv", 100, allInput, "CCS 5.5");
+        AssertContains(gel, "CCS 5.5 GEL/JTAG"); AssertContains(gel, "GEL_TextOut(\"sample\\n\")");
+        AssertContains(gel, "GEL_TextOut(\"%d\\n\",,,,,'GEL'::__dl_sample_count);");
+        GelTemplate.ValidateGeneratedScript(gel, 0);
+        string gelWithDialogs = GelTemplate.Build("C:\\x.csv", 100, allInput, "CCS 12.7.1", options.WritableVariables);
+        AssertContains(gelWithDialogs, "menuitem \"Target Variable Input\"");
+        AssertContains(gelWithDialogs, "dialog TargetInput_Set_1_yaw_ref(float value)");
+        AssertContains(gelWithDialogs, "'SYM'::gPositionControlObj[0].positionRef = value;");
+        AssertContains(gelWithDialogs, "dialog TargetInput_Set_2_count(unsigned long value)");
     }
 
     private static void TestBridgeReplay()
@@ -96,7 +173,7 @@ internal static class TestGenerator
 
     private static void TestBridgeConfigCompatibility()
     {
-        string legacyJson = "{\"CsvPath\":\"C:\\\\x.csv\",\"PeriodValue\":100,\"PeriodUnit\":\"ms\",\"GelPath\":\"C:\\\\x.gel\",\"Variables\":[{\"Name\":\"x\",\"Expression\":\"gX\",\"Type\":\"float32\",\"OutputFormat\":\"十进制\"}]}";
+        string legacyJson = "{\"CsvPath\":\"C:\\\\x.csv\",\"PeriodValue\":100,\"PeriodUnit\":\"ms\",\"GelPath\":\"C:\\\\x.gel\",\"VofaCommandPort\":1348,\"Variables\":[{\"Name\":\"x\",\"Expression\":\"gX\",\"Type\":\"float32\",\"OutputFormat\":\"十进制\"}]}";
         GeneratorConfig legacy = new JavaScriptSerializer().Deserialize<GeneratorConfig>(legacyJson);
         if (legacy.VofaEnabled || legacy.VofaPort != 0 || legacy.Variables[0].SendToVofa)
             throw new Exception("Legacy config must keep VOFA bridge disabled.");
@@ -104,11 +181,11 @@ internal static class TestGenerator
         var current = new GeneratorConfig
         {
             CsvPath = "x.csv", GelPath = "x.gel", PeriodValue = 100, PeriodUnit = "ms",
-            VofaEnabled = true, VofaAddress = "127.0.0.1", VofaPort = 1347, VofaReplayExisting = true,
+            VofaEnabled = true, VofaAddress = "127.0.0.1", VofaPort = 1347, CcsCorePattern = "C28xx_CPU1", VofaReplayExisting = true,
             Variables = new List<VariableItem> { new VariableItem { Name = "x", Expression = "gX", Type = "float32", OutputFormat = "十进制", SendToVofa = true } }
         };
         GeneratorConfig roundTrip = new JavaScriptSerializer().Deserialize<GeneratorConfig>(new JavaScriptSerializer().Serialize(current));
-        if (!roundTrip.VofaEnabled || roundTrip.VofaPort != 1347 || !roundTrip.Variables[0].SendToVofa)
+        if (!roundTrip.VofaEnabled || roundTrip.VofaPort != 1347 || roundTrip.CcsCorePattern != "C28xx_CPU1" || !roundTrip.Variables[0].SendToVofa)
             throw new Exception("VOFA bridge config round-trip failed.");
     }
 

@@ -26,6 +26,31 @@ gControllers[0].positionRef
 - CCS 8.3：Eclipse Debug 透视图中选中 CPU，`Tools → GEL Files` 加载，再从 Scripts 调用。不同补丁应先单变量、慢周期验证。
 - CCS 5.5：操作与旧 Eclipse 版相同，但必须现场验证定时器、连接/暂停检测、文件输出及运行态读取；API 未定义时不要删除安全检查强行运行。
 
+生成器中的“目标 CCS 版本”是全局配置。GEL 主体在各版本间尽量保持共同语法；输入桥接则必须区分环境：CCS 5.5/8.3/12.7.1 使用 Rhino/Java 的 Legacy DSS，CCS 20.x 使用 Node.js 的新 CCS Scripting，两类 JavaScript 不能互换。
+
+## VOFA+ 写入目标变量
+
+变量方向设为 `input` 或 `inout` 后，生成 GEL 时会同时生成 `_ccs_input_bridge.js`。先启动 GelGenerator 的 VOFA+ 桥接，再在对应 CCS 的 Scripting Console 加载此脚本。
+
+- CCS 5.5/8.3/12.7.1：在 Debug 视图选中正确 CPU，确认 Scripting Console 的 `activeDS` 可读取目标表达式，然后加载脚本。脚本通过 `activeDS.expression.evaluate()` 写入，并用 `evaluateToString()` 回读。
+- CCS 20.x：适配器依次复用`session`、`globalThis.__ggSession`或`activeDS`；都不存在时使用`ds`/`initScripting({inProcess:true})`列出当前核，并按照生成器中的CPU核匹配自动打开会话。通常不需要再次指定`.ccxml`。
+- VOFA+波形和SET命令共用一个1347全双工TCP连接；CCS输入适配器独立使用本机1349。GelGenerator不会把ACK/ERR文本发回FireWater连接，写入结果在生成器状态区显示。
+- 必须在 GelGenerator 桥接页手动打开“允许反向写入”；默认关闭。
+- 命令为 `SET,配置名称,数值`，如 `SET,yaw_ref,12.5`。不得发送 CCS 表达式，只有生成时固化的白名单可写。
+- 整数、bool和enum允许十进制或`0x`十六进制输入；float32/float64只接受十进制。`input`没有CSV输出格式；`inout`可以选择十进制或十六进制CSV输出，但FireWater始终发送十进制数值。
+
+## 从 CCS Scripts 直接写入
+
+`input/inout` 变量还会生成原生 GEL `dialog` 函数，不依赖 VOFA+ 或 JavaScript适配器。加载 GEL 后打开 `Scripts → Target Variable Input`，选择 `TargetInput_Set_序号_名称`，在弹窗中输入目标值。写入后 CCS Console 会显示实际回读值。`output` 变量不会生成写入函数。
+
+Scripts 写入与 VOFA+ 写入最终都通过 JTAG表达式访问目标变量；前者适合人工调参，后者适合由VOFA+控件发送低速指令。两者均不能作为实时闭环控制通道。
+
+CCS 20.x适配器支持重复加载和每1秒断线重连。写入优先执行`变量=数值`，失败后才尝试带类型转换。`NO_DEBUG_SESSION`表示两个接口均不可用，`ASSIGN_FAILED`表示两种赋值表达式均失败，`READBACK_FAILED`表示赋值后无法回读；真实异常会同时打印在Scripting Console。
+
+桥接页面分别显示“CCS写入适配器”TCP状态和“CCS目标会话”状态。CPU核使用固定下拉项`C28xx_CPU1/C28xx_CPU2/CPU1/CPU2`；目标会话应显示唯一核名并标记“已就绪”。
+
+Legacy DSS 与 CCS 20 Scripting 的表达式求值接口均为 CCS 原生调试服务器能力。参考：<https://software-dl.ti.com/ccs/esd/documents/scripting_api/ccs_12.8.0/dss/docs/DS_API/com/ti/debug/engine/scripting/Expression.html>、<https://software-dl.ti.com/ccs/esd/documents/users_guide_ccs_20.5.1/ccs_debug-scripting.html>。
+
 ## 控制函数
 
 - `DataLogger_Start`：覆盖旧 CSV、写表头并启动。
@@ -68,5 +93,6 @@ C28x `int/unsigned int` 通常为 16 位，`long/unsigned long` 为 32 位；`do
 - GEL 没有通用 `try/catch/finally`，不能捕获所有非法地址、USB 或驱动故障。
 - 指针必须非空并指向有效内存；修改 GEL 后须在 GEL Files 中 Reload。
 - VOFA+桥接是 PC端文件监听和 TCP转发，不改变 GEL的纯 JTAG采集方式，也不会暂停目标 CPU。
+- VOFA+ 反向写入也通过 JTAG 表达式求值完成。它不是实时控制链路，不能替代目标端控制协议；禁止用于高频闭环指令。
 - VOFA+中应选择 TCP Client 和 FireWater，连接生成器显示的监听地址与端口。
 - FireWater不携带通道名称；使用生成器自动复制的列表，在 VOFA+中按同一顺序命名。

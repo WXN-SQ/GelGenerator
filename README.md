@@ -4,13 +4,14 @@ Windows 桌面 GEL 数据采集脚本生成器，使用 C# WinForms 和 .NET Fra
 
 ## 功能与需求
 
-- 配置 CSV 列名、全局变量表达式、目标类型、十进制或十六进制输出。
+- 配置 `input/output/inout`、CSV/VOFA 名称、全局变量表达式、目标类型及输出格式。
 - 支持数组元素和多层结构体成员，不自动展开整数组/结构体。
 - 支持 int8/uint8/int16/uint16/int32/uint32、float32/float64、bool、enum16/enum32；浮点仅使用十进制。
 - 可配置 ms/s 周期，提供启动、停止、状态和异常后清理函数。
 - 保存/读取 JSON 配置；不兼容类型会报错。
 - 清理 CCS CPU/GEL 前缀，重组拆行 CSV，导出带筛选和冻结表头的 XLSX。
 - 超过 15 位有效数字的十进制整数字面量在 XLSX 中保存为文本。
+- 支持 CCS 5.5、8.3、12.7.1 和 20.x 版本化环境；可从 CCS Scripts 原生 GEL 对话框写入，也可通过 CCS Legacy DSS/新 Scripting 将 VOFA+ `SET` 命令写入白名单变量并回读。VOFA+波形与命令共用一个全双工连接，CCS适配器使用独立本机端口。
 
 ## 环境与快速使用
 
@@ -44,7 +45,7 @@ $compiler = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if ($LASTEXITCODE -eq 0) { & .\tests\TestGenerator.exe }
 ```
 
-测试覆盖模板生成、部分配置迁移、格式拒绝、CSV 清理/拆行和大整数 XLSX 文本保存。生成模板的字符串断言不等于 GEL 解释器或目标板边界测试。
+测试覆盖模板生成、配置迁移、格式拒绝、输入边界值、uint32 最大值、双向 TCP 转发、CSV 清理/拆行和大整数 XLSX 文本保存。生成模板测试不等于 GEL/DSS 解释器或目标板实机验证。
 
 ## 当前限制与待验证项
 
@@ -84,6 +85,10 @@ README/                      详细使用说明
 | 2026-09-10 界面调整 | 增加 int8/uint8，简化类型名称；移除 int64/uint64、科学计数法及精度列 |
 | 2026-09-10 位宽调整 | int32/uint32 改用 long/unsigned long；枚举拆分；周期与计数器加宽 |
 | Git 管理基线 | 添加忽略规则、保留所有权利声明、根 README 和已知限制 |
+| 2026-09-22 双向桥接 | 增加 input/output/inout、CCS 版本选择、VOFA+ SET 写入、DSS/Scripting 适配器及写后回读 |
+| 2026-09-22 CCS20适配器修复 | 自动兼容session/activeDS、无转换优先、错误分类、安全重复加载和断线重连 |
+| 2026-09-22 会话自动初始化 | CCS20自动listCores/openSession、CPU核匹配、目标会话状态和VOFA首次命令流同步 |
+| 2026-09-23 单连接双向桥接 | VOFA+波形/命令合并为一个TCP连接、取消文本ACK回传、CPU核改为固定下拉选择 |
 
 后续建议每次发布记录变更及验证环境，并使用 Git 标签标记实际测试过的版本。
 

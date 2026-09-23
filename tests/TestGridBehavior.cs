@@ -11,11 +11,29 @@ internal static class TestGridBehavior
         using (var form = new MainForm())
         {
             var grid = (DataGridView)typeof(MainForm).GetField("grid", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(form);
+            var bridgeConnection = (Label)typeof(MainForm).GetField("lblBridgeConnection", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(form);
+            var coreSelector = (ComboBox)typeof(MainForm).GetField("cmbCcsCorePattern", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(form);
             form.CreateControl();
             grid.CreateControl();
-            int rowIndex = grid.Rows.Add("name_only", "gObject.member", "float32", "十进制", false);
+            int rowIndex = grid.Rows.Add("output", "name_only", "gObject.member", "float32", "十进制", false);
             if (grid.SelectionMode != DataGridViewSelectionMode.RowHeaderSelect)
                 throw new Exception("Grid selection mode is not RowHeaderSelect.");
+            if (!bridgeConnection.AutoSize || !bridgeConnection.Text.StartsWith("VOFA+ 波形连接："))
+                throw new Exception("Bridge status label is still clipped or ambiguously named.");
+            if (coreSelector.DropDownStyle != ComboBoxStyle.DropDownList || coreSelector.Text != "C28xx_CPU1" || coreSelector.Items.Count != 4)
+                throw new Exception("CPU core selector is not the required fixed dropdown.");
+            foreach (string expected in new[] { "C28xx_CPU1", "C28xx_CPU2", "CPU1", "CPU2" })
+                if (!coreSelector.Items.Contains(expected)) throw new Exception("Missing CPU core option: " + expected);
+
+            grid.Rows[rowIndex].Cells["DirectionColumn"].Value = "input";
+            typeof(MainForm).GetMethod("ApplyDirectionState", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(form, new object[] { rowIndex });
+            if (Convert.ToString(grid.Rows[rowIndex].Cells["FormatColumn"].Value) != "无" || !grid.Rows[rowIndex].Cells["FormatColumn"].ReadOnly)
+                throw new Exception("Input row must use a disabled no-output format.");
+            grid.Rows[rowIndex].Cells["DirectionColumn"].Value = "inout";
+            typeof(MainForm).GetMethod("ApplyDirectionState", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(form, new object[] { rowIndex });
+            if (grid.Rows[rowIndex].Cells["FormatColumn"].ReadOnly || Convert.ToString(grid.Rows[rowIndex].Cells["FormatColumn"].Value) != "十进制")
+                throw new Exception("Inout row did not restore an editable output format.");
+            grid.Rows[rowIndex].Cells["FormatColumn"].Value = "十六进制";
 
             grid.ClearSelection();
             grid.CurrentCell = grid.Rows[rowIndex].Cells["NameColumn"];

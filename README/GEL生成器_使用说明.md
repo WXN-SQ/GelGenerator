@@ -1,12 +1,14 @@
 # GEL 生成器使用说明
 
+生成的固定 CSV 路径统一使用 `#define DL_CSV_PATH "..."`，兼容用户已验证的 CCS 5.5 加载方式。宏末尾没有分号，Windows 路径仍使用双反斜杠转义。已有 GEL 文件需要重新生成并在 CCS 中 Reload。
+
 ## 软件功能
 
 项目顶层 `GelGenerator.exe` 可生成纯 CCS GEL/JTAG 低速采集脚本、生成并运行 VOFA+ FireWater 实时桥接，以及批量清理 CCS CSV 前缀并转换为 `.xlsx`。面向 Windows 10/11 x64，使用系统 .NET Framework；独立桥接脚本使用 Windows 自带 PowerShell，无需 Python、MATLAB 或 Excel。
 
 ## 变量配置
 
-每行填写方向、CSV/VOFA 名称、CCS/GEL 变量表达式、目标数据类型和输出格式。方向含义：`output` 只采集，`input` 只允许写入且输出格式固定为“无”，`inout` 同时采集和写入并可选择十进制或十六进制。支持数组元素、多层结构体成员和有效指针成员：
+每行填写方向、CSV/VOFA 名称、CCS/GEL 变量表达式、目标数据类型和数值格式。方向含义：`output` 只采集，`input` 只允许写入，`inout` 同时采集和写入。三种方向均可记录十进制或十六进制要求；浮点类型只能选择十进制。支持数组元素、多层结构体成员和有效指针成员：
 
 ```text
 gTelemetry.attitude.yaw
@@ -58,6 +60,22 @@ gDevicePtr->controller.feedback
 
 “生成 GEL 文件”旁必须选择目标 CCS 版本：CCS 5.5、8.3、12.7.1 或 20.x。该全局选项同时决定 GEL 文件标识和输入桥接适配器类型；旧 JSON 配置默认迁移为 CCS 12.7.1，旧变量默认迁移为 `output`。
 
+### 生成 VOFA+ 命令配置文件
+
+勾选“生成 VOFA+ 命令配置文件”后，点击“生成 GEL 文件”会在 GEL 同目录额外生成：
+
+```text
+原GEL文件名_vofa.cmds.json
+```
+
+该复选框默认关闭，与“启用 VOFA+桥接并生成独立脚本”相互独立，并随生成器 JSON 配置保存和恢复。命令配置只包含 `input/inout`，`output` 不可写，因此不会生成命令；不存在可写变量时会拒绝生成。生成文件可由 VOFA+ 的命令列表载入。
+
+自动命令均为 Str/ASCII 模式（`hex_on:false`），结尾带 LF 字节 `0A`：有符号整数及枚举使用 `%d`，无符号整数及 bool 使用 `%u`，浮点使用 `%f`。`cmd_hex` 是 ASCII 命令的十六进制字节表示，并不代表 VOFA+ Hex 模式。
+
+VOFA+ 官方把 Str 命令参数定义为 Float 模式；Hex 模式的 `%%` 是原始字节替换，不能用来动态生成文本 `0xC0`。因此，即使变量的“数值格式”为十六进制，生成器也不会生成未经官方验证的 `0x%X`，而是在命令说明中标记要求，动态占位符仍使用十进制。需要十六进制字面量时，可直接发送 `SET,workMode,0xC0`。`uint32` 动态参数超过 `16777216` 时可能因 Float 有效精度丢失；完整大整数应使用固定文本命令或直接发送完整文本。
+
+VOFA+ 官方参考：<https://www.vofa.plus/docs/learning/start/data_cmd_parameter/>、<https://www.vofa.plus/docs/learning/widgets/slider/>。
+
 ## VOFA+ 实时桥接
 
 在 GEL生成页勾选“启用 VOFA+桥接并生成独立脚本”后，`output/inout` 行的“发送到 VOFA+”才可编辑；`input` 行不会进入 CSV。生成 GEL 时会在相同目录生成：
@@ -105,7 +123,7 @@ VOFA+：TCP Client
 
 写入支持 int8/uint8/int16/uint16/int32/uint32、float32/float64、bool、enum16/enum32。整数、布尔和枚举可用十进制或带 `0x` 前缀的十六进制，例如 `SET,flags,0xFF`、`SET,count,0xFFFFFFFF`；浮点只接受十进制。生成器会拒绝整数小数、溢出值、无符号负数、NaN、Infinity，以及 bool 的非 0/1/0x0/0x1 值。ACK统一返回十进制回读值。未设置最小值/最大值；请在控制算法中自行保证指令范围。
 
-`inout`选择十六进制时，CSV按十六进制保存；VOFA+ FireWater波形仍转换为十进制数值，避免协议解析歧义。
+`output/inout` 选择十六进制时，CSV按十六进制保存；`input` 的数值格式用于记录命令进制要求，不进入CSV。VOFA+ FireWater波形仍转换为十进制数值，避免协议解析歧义。
 
 CCS 20.x适配器可安全重复加载：新脚本会停止旧Socket再建立连接，不会出现`Identifier 'socket' has already been declared`。GelGenerator尚未启动或重启时，适配器每1秒自动重连。写入先尝试无强制转换表达式，失败后才尝试带类型转换；错误区分为`NO_DEBUG_SESSION`、`ASSIGN_FAILED`和`READBACK_FAILED`，详细异常打印在CCS Scripting Console。
 
@@ -125,7 +143,7 @@ CPU核匹配为固定下拉选项：`C28xx_CPU1`、`C28xx_CPU2`、`CPU1`、`CPU2
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\Logger\data_logger_vofa_bridge.ps1"
 ```
 
-桥接开关、变量选择、地址、端口和回放模式会随 JSON配置保存。旧配置默认不启用桥接。
+桥接开关、VOFA+命令配置开关、变量选择、地址、端口和回放模式会随 JSON配置保存。旧配置默认不启用桥接，也不生成命令配置；旧 input 的“无”格式自动迁移为十进制。
 
 旧 JSON 配置中的 `float/double/int/unsigned int/hex` 及上一版带括号的明确类型会自动迁移。旧科学计数法迁移为十进制；旧 `int64/uint64/string` 和宽度不明确的旧 `enum` 会被拒绝。
 
@@ -142,7 +160,7 @@ TI 官方 GEL 文档确认参数可接收目标符号/表达式；格式仅支�
 - <https://software-dl.ti.com/ccs/esd/documents/users_guide_12.7.0/gel/format.html>
 - <https://software-dl.ti.com/ccs/esd/documents/users_guide/gel/param.html>
 
-软件自动测试覆盖类型/格式校验、旧配置迁移、结构体/数组表达式、输入数值边界、uint32 最大值不截断、双 TCP 通道命令转发与回读、各代适配器模板、CSV 前缀清理与拆行重组、Excel 15 位整数边界。
+软件自动测试覆盖类型/格式校验、旧配置迁移、结构体/数组表达式、VOFA+命令JSON及ASCII字节、禁止动态`%X`、输入数值边界、uint32 最大值不截断、双 TCP 通道命令转发与回读、各代适配器模板、CSV 前缀清理与拆行重组、Excel 15 位整数边界。
 
 自动测试不能代替 CCS 实机验证。首次使用 `Uint32/unsigned long`、enum32、float64 或特定 typedef 时，应在具体 C28x、ABI、CCS 和仿真器组合上用边界值比较 Expressions 与 CSV。GEL `%u/%x` 没有长度修饰符，因此 32 位格式化结果必须以实机结果为准。
 

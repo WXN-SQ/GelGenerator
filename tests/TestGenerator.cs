@@ -34,7 +34,8 @@ internal static class TestGenerator
             new VariableItem { Name = "mode", Expression = "gModes[0].state", Type = "enum32", OutputFormat = "十进制" }
         };
         string gel = GelTemplate.Build("C:\\Data Folder\\log.csv", 10000, variables);
-        AssertContains(gel, "string DL_CSV_PATH = \"C:\\\\Data Folder\\\\log.csv\";");
+        AssertContains(gel, "#define DL_CSV_PATH \"C:\\\\Data Folder\\\\log.csv\"");
+        AssertNotContains(gel, "string DL_CSV_PATH");
         AssertContains(gel, "sample,angle_yaw,ratio,state,count,flags,mode\\n");
         AssertContains(gel, "long double dl_v1;");
         AssertContains(gel, "unsigned long dl_v3;");
@@ -56,6 +57,7 @@ internal static class TestGenerator
         TestBridgeEndToEnd();
         TestBridgeReplay();
         TestBridgeConfigCompatibility();
+        TestVofaCommandConfig();
         TestInputBridge();
         TestInputBridgeEndToEnd();
         TestCsvConversion();
@@ -128,6 +130,8 @@ internal static class TestGenerator
         AssertNotContains(modern, "const socket");
         var allInput = new List<VariableItem>();
         string gel = GelTemplate.Build("C:\\x.csv", 100, allInput, "CCS 5.5");
+        AssertContains(gel, "#define DL_CSV_PATH \"C:\\\\x.csv\"");
+        AssertNotContains(gel, "string DL_CSV_PATH");
         AssertContains(gel, "CCS 5.5 GEL/JTAG"); AssertContains(gel, "GEL_TextOut(\"sample\\n\")");
         AssertContains(gel, "GEL_TextOut(\"%d\\n\",,,,,'GEL'::__dl_sample_count);");
         GelTemplate.ValidateGeneratedScript(gel, 0);
@@ -182,11 +186,36 @@ internal static class TestGenerator
         {
             CsvPath = "x.csv", GelPath = "x.gel", PeriodValue = 100, PeriodUnit = "ms",
             VofaEnabled = true, VofaAddress = "127.0.0.1", VofaPort = 1347, CcsCorePattern = "C28xx_CPU1", VofaReplayExisting = true,
+            GenerateVofaCommandConfig = true,
             Variables = new List<VariableItem> { new VariableItem { Name = "x", Expression = "gX", Type = "float32", OutputFormat = "十进制", SendToVofa = true } }
         };
         GeneratorConfig roundTrip = new JavaScriptSerializer().Deserialize<GeneratorConfig>(new JavaScriptSerializer().Serialize(current));
-        if (!roundTrip.VofaEnabled || roundTrip.VofaPort != 1347 || roundTrip.CcsCorePattern != "C28xx_CPU1" || !roundTrip.Variables[0].SendToVofa)
+        if (!roundTrip.VofaEnabled || !roundTrip.GenerateVofaCommandConfig || roundTrip.VofaPort != 1347 || roundTrip.CcsCorePattern != "C28xx_CPU1" || !roundTrip.Variables[0].SendToVofa)
             throw new Exception("VOFA bridge config round-trip failed.");
+    }
+
+    private static void TestVofaCommandConfig()
+    {
+        var variables = new List<VariableItem>
+        {
+            new VariableItem { Direction="input", Name="workMode", Expression="gMode", Type="uint8", OutputFormat="十六进制" },
+            new VariableItem { Direction="input", Name="offset", Expression="gOffset", Type="int16", OutputFormat="十进制" },
+            new VariableItem { Direction="inout", Name="yawRef", Expression="gYaw", Type="uint32", OutputFormat="十进制" },
+            new VariableItem { Direction="inout", Name="gain", Expression="gGain", Type="float32", OutputFormat="十进制" }
+        };
+        string json = VofaCommandConfigTemplate.Build("sample", variables);
+        AssertContains(json, "\"type\":\"cmds\"");
+        AssertContains(json, "input 输入变量");
+        AssertContains(json, "inout 双向变量");
+        AssertContains(json, "53 45 54 2C 77 6F 72 6B 4D 6F 64 65 2C 25 75 0A");
+        AssertContains(json, "53 45 54 2C 6F 66 66 73 65 74 2C 25 64 0A");
+        AssertContains(json, "53 45 54 2C 67 61 69 6E 2C 25 66 0A");
+        AssertContains(json, "动态命令按十进制占位符发送");
+        AssertNotContains(json, "25 58");
+        AssertNotContains(json, "25 78");
+        AssertContains(json, "\"hex_on\":false");
+        if (!VofaCommandConfigTemplate.OutputPath("C:\\data\\logger.gel").EndsWith("logger_vofa.cmds.json"))
+            throw new Exception("VOFA command config output path is incorrect.");
     }
 
     private static void TestBridgeParsingAndTemplate()
@@ -264,6 +293,9 @@ internal static class TestGenerator
 
         VariableItem scientific = GelTemplate.MigrateLegacy(new VariableItem { Type = "float32", OutputFormat = "科学计数法" });
         if (scientific.OutputFormat != "十进制") throw new Exception("Scientific format migration failed.");
+
+        VariableItem oldInput = GelTemplate.MigrateLegacy(new VariableItem { Direction = "input", Type = "uint8", OutputFormat = "无" });
+        if (oldInput.OutputFormat != "十进制") throw new Exception("Legacy input format migration failed.");
 
         bool int64Rejected = false;
         try { GelTemplate.MigrateLegacy(new VariableItem { Type = "uint64（当前禁用：GEL 无 64 位整数格式）", OutputFormat = "十进制" }); }

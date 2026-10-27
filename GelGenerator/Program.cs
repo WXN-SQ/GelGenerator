@@ -50,6 +50,7 @@ namespace GelGenerator
         public string CcsVersion { get; set; }
         public bool VofaWriteEnabled { get; set; }
         public string CcsCorePattern { get; set; }
+        public bool GenerateVofaCommandConfig { get; set; }
     }
 
     public sealed class MainForm : Form
@@ -66,6 +67,7 @@ namespace GelGenerator
         private readonly TextBox txtXlsxDirectory = new TextBox();
         private readonly Label lblConvertStatus = new Label();
         private readonly CheckBox chkVofaEnabled = new CheckBox();
+        private readonly CheckBox chkGenerateVofaCommands = new CheckBox();
         private readonly ComboBox cmbCcsVersion = new ComboBox();
         private readonly CheckBox chkVofaWriteEnabled = new CheckBox();
         private readonly TextBox txtBridgeCsvPath = new TextBox();
@@ -96,7 +98,7 @@ namespace GelGenerator
 
         internal static readonly string[] OutputFormats =
         {
-            "无", "十进制", "十六进制"
+            "十进制", "十六进制"
         };
 
         internal static readonly string[] Directions = { "output", "input", "inout" };
@@ -204,6 +206,10 @@ namespace GelGenerator
             chkVofaEnabled.AutoSize = true;
             settings.Controls.Add(chkVofaEnabled, 1, 3);
             settings.SetColumnSpan(chkVofaEnabled, 3);
+            chkGenerateVofaCommands.Text = "生成 VOFA+ 命令配置文件";
+            chkGenerateVofaCommands.AutoSize = true;
+            settings.Controls.Add(chkGenerateVofaCommands, 1, 4);
+            settings.SetColumnSpan(chkGenerateVofaCommands, 3);
             root.Controls.Add(settings, 0, 0);
 
             var note = new Label
@@ -251,7 +257,7 @@ namespace GelGenerator
             grid.Columns.Add(typeColumn);
             var formatColumn = new DataGridViewComboBoxColumn
             {
-                Name = "FormatColumn", HeaderText = "输出格式", DataPropertyName = "OutputFormat",
+                Name = "FormatColumn", HeaderText = "数值格式", DataPropertyName = "OutputFormat",
                 Width = 105, FlatStyle = FlatStyle.Flat
             };
             formatColumn.Items.AddRange(OutputFormats);
@@ -718,14 +724,10 @@ namespace GelGenerator
             DataGridViewRow row = grid.Rows[rowIndex];
             string direction = CellText(row, "DirectionColumn");
             bool output = direction != "input";
-            row.Cells["FormatColumn"].ReadOnly = !output;
+            row.Cells["FormatColumn"].ReadOnly = false;
             row.Cells["VofaColumn"].ReadOnly = !output || !chkVofaEnabled.Checked;
-            if (!output)
-            {
-                row.Cells["FormatColumn"].Value = "无";
-                row.Cells["VofaColumn"].Value = false;
-            }
-            else if (CellText(row, "FormatColumn") == "无" || String.IsNullOrWhiteSpace(CellText(row, "FormatColumn")))
+            if (!output) row.Cells["VofaColumn"].Value = false;
+            if (CellText(row, "FormatColumn") == "无" || String.IsNullOrWhiteSpace(CellText(row, "FormatColumn")))
                 row.Cells["FormatColumn"].Value = "十进制";
         }
 
@@ -912,12 +914,7 @@ namespace GelGenerator
                     if (!names.Add(name)) throw new InvalidOperationException("CSV 列名称重复：" + name);
                     if (Array.IndexOf(GelTypes, type) < 0) throw new InvalidOperationException("第 " + logicalRow + " 行的变量类型无效。");
                     if (Array.IndexOf(Directions, direction) < 0) throw new InvalidOperationException("第 " + logicalRow + " 行的方向无效。");
-                    if (direction == "input")
-                    {
-                        if (outputFormat != "无") throw new InvalidOperationException("第 " + logicalRow + " 行为 input，输出格式必须为无。");
-                        GelTemplate.ValidateTypeAndFormat(type, "十进制");
-                    }
-                    else GelTemplate.ValidateTypeAndFormat(type, outputFormat);
+                    GelTemplate.ValidateTypeAndFormat(type, outputFormat);
                 }
                 list.Add(new VariableItem { Direction = direction, Name = name, Expression = expression, Type = type, OutputFormat = outputFormat, SendToVofa = sendToVofa && direction != "input" });
             }
@@ -964,8 +961,22 @@ namespace GelGenerator
                 List<VariableItem> writableVariables = variables.FindAll(delegate(VariableItem v) { return v.Direction == "input" || v.Direction == "inout"; });
                 string script = GelTemplate.Build(txtCsvPath.Text, period, outputVariables, cmbCcsVersion.Text, writableVariables);
                 GelTemplate.ValidateGeneratedScript(script, outputVariables.Count);
+                string commandsPath = null;
+                string commandsJson = null;
+                if (chkGenerateVofaCommands.Checked)
+                {
+                    if (writableVariables.Count == 0)
+                        throw new InvalidOperationException("已选择生成 VOFA+ 命令配置文件，但变量表中没有 input 或 inout 变量。");
+                    commandsPath = VofaCommandConfigTemplate.OutputPath(txtGelPath.Text);
+                    commandsJson = VofaCommandConfigTemplate.Build(Path.GetFileNameWithoutExtension(txtGelPath.Text), writableVariables);
+                }
                 File.WriteAllText(txtGelPath.Text, script, new UTF8Encoding(false));
                 string extra = String.Empty;
+                if (chkGenerateVofaCommands.Checked)
+                {
+                    File.WriteAllText(commandsPath, commandsJson, new UTF8Encoding(false));
+                    extra += "\nVOFA+ 命令配置：\n" + commandsPath;
+                }
                 if (chkVofaEnabled.Checked)
                 {
                     string bridgePath = BridgeScriptPath(txtGelPath.Text);
@@ -1006,6 +1017,7 @@ namespace GelGenerator
                 ,CcsVersion = cmbCcsVersion.Text
                 ,VofaWriteEnabled = chkVofaWriteEnabled.Checked
                 ,CcsCorePattern = cmbCcsCorePattern.Text
+                ,GenerateVofaCommandConfig = chkGenerateVofaCommands.Checked
             };
         }
 
@@ -1046,6 +1058,7 @@ namespace GelGenerator
                     radReplay.Checked = config.VofaReplayExisting;
                     radFollowNew.Checked = !config.VofaReplayExisting;
                     chkVofaEnabled.Checked = config.VofaEnabled;
+                    chkGenerateVofaCommands.Checked = config.GenerateVofaCommandConfig;
                     cmbCcsVersion.SelectedItem = Array.IndexOf(CcsVersions, config.CcsVersion) >= 0 ? config.CcsVersion : "CCS 12.7.1";
                     chkVofaWriteEnabled.Checked = config.VofaEnabled && config.VofaWriteEnabled;
                     string core = Array.IndexOf(new[] { "C28xx_CPU1", "C28xx_CPU2", "CPU1", "CPU2" }, config.CcsCorePattern) >= 0 ? config.CcsCorePattern : "C28xx_CPU1";
@@ -1097,6 +1110,90 @@ namespace GelGenerator
         public string LastCommand;
         public string LastResponse;
         public string TargetSessionStatus;
+    }
+
+    internal static class VofaCommandConfigTemplate
+    {
+        public static string OutputPath(string gelPath)
+        {
+            return Path.Combine(Path.GetDirectoryName(Path.GetFullPath(gelPath)),
+                Path.GetFileNameWithoutExtension(gelPath) + "_vofa.cmds.json");
+        }
+
+        public static string Build(string gelName, IList<VariableItem> writableVariables)
+        {
+            if (writableVariables == null || writableVariables.Count == 0)
+                throw new InvalidOperationException("VOFA+ 命令配置至少需要一个 input 或 inout 变量。");
+
+            var input = new List<object>();
+            var inout = new List<object>();
+            for (int i = 0; i < writableVariables.Count; i++)
+            {
+                VariableItem item = GelTemplate.MigrateLegacy(writableVariables[i]);
+                if (item.Direction != "input" && item.Direction != "inout") continue;
+                GelTemplate.ValidateTypeAndFormat(item.Type, item.OutputFormat);
+                if (String.IsNullOrWhiteSpace(item.Name)) throw new InvalidOperationException("VOFA+ 命令名称不能为空。");
+                object command = Command(item);
+                if (item.Direction == "input") input.Add(command); else inout.Add(command);
+            }
+            if (input.Count == 0 && inout.Count == 0)
+                throw new InvalidOperationException("VOFA+ 命令配置中没有可写变量。");
+
+            var groups = new List<object>();
+            if (input.Count > 0) groups.Add(Group("input 输入变量", input));
+            if (inout.Count > 0) groups.Add(Group("inout 双向变量", inout));
+            var root = new Dictionary<string, object>
+            {
+                { "type", "cmds" },
+                { "vnumber", 100 },
+                { "ctx", Group(String.IsNullOrWhiteSpace(gelName) ? "GelGenerator" : gelName, groups) }
+            };
+            return new JavaScriptSerializer().Serialize(root);
+        }
+
+        private static object Command(VariableItem item)
+        {
+            string placeholder = Placeholder(item.Type);
+            string text = "SET," + item.Name + "," + placeholder + "\n";
+            string intro = item.Direction + "；" + item.Type + "；数值格式=" + item.OutputFormat + "。";
+            if (item.OutputFormat == "十六进制")
+                intro += "VOFA+ Str 参数是 Float 模式，动态命令按十进制占位符发送；需要十六进制字面量时请直接发送 SET," + item.Name + ",0x...。";
+            if (item.Type == "uint32")
+                intro += "动态参数超过 16777216 时可能受 Float 有效精度限制。";
+            return new Dictionary<string, object>
+            {
+                { "name", item.Name }, { "intro_on", true }, { "intro", intro },
+                { "hex_on", false }, { "loop_on", true }, { "loop_ms", 100 }, { "loop_count", 1 },
+                { "cmd_hex", AsciiHex(text) }, { "is_group", false }, { "down", false },
+                { "subCmds", new object[0] }
+            };
+        }
+
+        private static object Group(string name, IList<object> children)
+        {
+            return new Dictionary<string, object>
+            {
+                { "name", name }, { "intro_on", true }, { "intro", "GelGenerator 自动生成" },
+                { "hex_on", false }, { "loop_on", true }, { "loop_ms", 100 }, { "loop_count", 1 },
+                { "cmd_hex", String.Empty }, { "is_group", true }, { "down", true },
+                { "subCmds", children }
+            };
+        }
+
+        private static string Placeholder(string type)
+        {
+            if (type == "float32" || type == "float64") return "%f";
+            if (type == "uint8" || type == "uint16" || type == "uint32" || type == "bool") return "%u";
+            return "%d";
+        }
+
+        private static string AsciiHex(string value)
+        {
+            byte[] bytes = Encoding.ASCII.GetBytes(value);
+            var parts = new string[bytes.Length];
+            for (int i = 0; i < bytes.Length; i++) parts[i] = bytes[i].ToString("X2", CultureInfo.InvariantCulture);
+            return String.Join(" ", parts);
+        }
     }
 
     internal sealed class VofaBridgeService : IDisposable
@@ -2056,8 +2153,7 @@ namespace GelGenerator
             if (String.IsNullOrWhiteSpace(format)) format = "十进制";
             if (format == "科学计数法") format = "十进制";
             string direction = Array.IndexOf(MainForm.Directions, item.Direction) >= 0 ? item.Direction : "output";
-            if (direction == "input") format = "无";
-            else if (format == "无") format = "十进制";
+            if (format == "无") format = "十进制";
             return new VariableItem { Direction = direction, Name = item.Name, Expression = item.Expression, Type = type, OutputFormat = format, SendToVofa = item.SendToVofa };
         }
 
@@ -2098,7 +2194,7 @@ namespace GelGenerator
             b.AppendLine(" * 仅适合几 Hz～几十 Hz，严禁用于 kHz 级高速控制环采集。");
             b.AppendLine(" ****************************************************************************/");
             b.AppendLine();
-            b.AppendLine("string DL_CSV_PATH = \"" + EscapeGelString(csvPath) + "\";");
+            b.AppendLine("#define DL_CSV_PATH \"" + EscapeGelString(csvPath) + "\"");
             b.AppendLine("long DL_SAMPLE_PERIOD_MS = " + periodMs.ToString(CultureInfo.InvariantCulture) + "L;");
             b.AppendLine("int DL_STATUS_PRINT_INTERVAL = 10;");
             b.AppendLine("int DL_TIMER_ID = 1001;");

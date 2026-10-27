@@ -26,6 +26,8 @@ gControllers[0].positionRef
 - CCS 8.3：Eclipse Debug 透视图中选中 CPU，`Tools → GEL Files` 加载，再从 Scripts 调用。不同补丁应先单变量、慢周期验证。
 - CCS 5.5：操作与旧 Eclipse 版相同，但必须现场验证定时器、连接/暂停检测、文件输出及运行态读取；API 未定义时不要删除安全检查强行运行。
 
+生成器统一将固定输出路径生成为预处理宏，例如 `#define DL_CSV_PATH "C:\\data\\log.csv"`，末尾不加分号。该写法直接向文件输出函数传入字符串常量，绕过全局字符串变量声明。用户在 CCS 5.5 环境中已验证，此方式可以解决原 `string DL_CSV_PATH = "...";` 行的导入报错；没有原始错误信息时，不能据此断言所有 CCS 5.5 均不支持全局字符串。修改路径后需重新加载 GEL。
+
 生成器中的“目标 CCS 版本”是全局配置。GEL 主体在各版本间尽量保持共同语法；输入桥接则必须区分环境：CCS 5.5/8.3/12.7.1 使用 Rhino/Java 的 Legacy DSS，CCS 20.x 使用 Node.js 的新 CCS Scripting，两类 JavaScript 不能互换。
 
 ## VOFA+ 写入目标变量
@@ -37,7 +39,9 @@ gControllers[0].positionRef
 - VOFA+波形和SET命令共用一个1347全双工TCP连接；CCS输入适配器独立使用本机1349。GelGenerator不会把ACK/ERR文本发回FireWater连接，写入结果在生成器状态区显示。
 - 必须在 GelGenerator 桥接页手动打开“允许反向写入”；默认关闭。
 - 命令为 `SET,配置名称,数值`，如 `SET,yaw_ref,12.5`。不得发送 CCS 表达式，只有生成时固化的白名单可写。
-- 整数、bool和enum允许十进制或`0x`十六进制输入；float32/float64只接受十进制。`input`没有CSV输出格式；`inout`可以选择十进制或十六进制CSV输出，但FireWater始终发送十进制数值。
+- 整数、bool和enum允许十进制或`0x`十六进制输入；float32/float64只接受十进制。变量表三种方向均显示“数值格式”；`input`的格式用于记录VOFA命令进制要求但不进入CSV，`output/inout`决定CSV格式，FireWater始终发送十进制数值。
+
+如在生成器勾选“生成 VOFA+ 命令配置文件”，会同时生成 `_vofa.cmds.json`，其中只包含 `input/inout` 白名单变量。配置使用 Str/ASCII 模式及 `%d/%u/%f`；十六进制变量不会生成 `0x%X`，因为 VOFA+ 官方未确认该动态格式，且 Str 参数属于 Float 模式。固定十六进制文本如 `SET,workMode,0xC0` 可由桥接器正确解析。`uint32` 大于 `16777216` 时不要依赖 VOFA+ 动态 Float 参数保持逐整数精度。
 
 ## 从 CCS Scripts 直接写入
 

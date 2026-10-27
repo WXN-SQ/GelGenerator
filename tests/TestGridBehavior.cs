@@ -13,6 +13,7 @@ internal static class TestGridBehavior
             var grid = (DataGridView)typeof(MainForm).GetField("grid", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(form);
             var bridgeConnection = (Label)typeof(MainForm).GetField("lblBridgeConnection", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(form);
             var coreSelector = (ComboBox)typeof(MainForm).GetField("cmbCcsCorePattern", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(form);
+            var commandConfig = (CheckBox)typeof(MainForm).GetField("chkGenerateVofaCommands", BindingFlags.Instance | BindingFlags.NonPublic).GetValue(form);
             form.CreateControl();
             grid.CreateControl();
             int rowIndex = grid.Rows.Add("output", "name_only", "gObject.member", "float32", "十进制", false);
@@ -24,11 +25,13 @@ internal static class TestGridBehavior
                 throw new Exception("CPU core selector is not the required fixed dropdown.");
             foreach (string expected in new[] { "C28xx_CPU1", "C28xx_CPU2", "CPU1", "CPU2" })
                 if (!coreSelector.Items.Contains(expected)) throw new Exception("Missing CPU core option: " + expected);
+            if (commandConfig.Checked || commandConfig.Text != "生成 VOFA+ 命令配置文件")
+                throw new Exception("VOFA command-config checkbox default or label is incorrect.");
 
             grid.Rows[rowIndex].Cells["DirectionColumn"].Value = "input";
             typeof(MainForm).GetMethod("ApplyDirectionState", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(form, new object[] { rowIndex });
-            if (Convert.ToString(grid.Rows[rowIndex].Cells["FormatColumn"].Value) != "无" || !grid.Rows[rowIndex].Cells["FormatColumn"].ReadOnly)
-                throw new Exception("Input row must use a disabled no-output format.");
+            if (Convert.ToString(grid.Rows[rowIndex].Cells["FormatColumn"].Value) != "十进制" || grid.Rows[rowIndex].Cells["FormatColumn"].ReadOnly)
+                throw new Exception("Input row must retain an editable numeric format.");
             grid.Rows[rowIndex].Cells["DirectionColumn"].Value = "inout";
             typeof(MainForm).GetMethod("ApplyDirectionState", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(form, new object[] { rowIndex });
             if (grid.Rows[rowIndex].Cells["FormatColumn"].ReadOnly || Convert.ToString(grid.Rows[rowIndex].Cells["FormatColumn"].Value) != "十进制")

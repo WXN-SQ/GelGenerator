@@ -4,7 +4,7 @@ Windows 桌面 GEL 数据采集脚本生成器，使用 C# WinForms 和 .NET Fra
 
 ## 功能与需求
 
-- 配置 `input/output/inout`、CSV/VOFA 名称、全局变量表达式、目标类型及输出格式。
+- 配置 `input/output/inout`、CSV/VOFA 名称、全局变量表达式、目标类型及十进制/十六进制数值格式。
 - 支持数组元素和多层结构体成员，不自动展开整数组/结构体。
 - 支持 int8/uint8/int16/uint16/int32/uint32、float32/float64、bool、enum16/enum32；浮点仅使用十进制。
 - 可配置 ms/s 周期，提供启动、停止、状态和异常后清理函数。
@@ -12,6 +12,7 @@ Windows 桌面 GEL 数据采集脚本生成器，使用 C# WinForms 和 .NET Fra
 - 清理 CCS CPU/GEL 前缀，重组拆行 CSV，导出带筛选和冻结表头的 XLSX。
 - 超过 15 位有效数字的十进制整数字面量在 XLSX 中保存为文本。
 - 支持 CCS 5.5、8.3、12.7.1 和 20.x 版本化环境；可从 CCS Scripts 原生 GEL 对话框写入，也可通过 CCS Legacy DSS/新 Scripting 将 VOFA+ `SET` 命令写入白名单变量并回读。VOFA+波形与命令共用一个全双工连接，CCS适配器使用独立本机端口。
+- 可选择随 GEL 生成 VOFA+ `.cmds.json`；仅包含 input/inout，采用官方 Str 参数规则，不生成未经验证的动态 `%X`。
 
 ## 环境与快速使用
 
@@ -89,6 +90,10 @@ README/                      详细使用说明
 | 2026-09-22 CCS20适配器修复 | 自动兼容session/activeDS、无转换优先、错误分类、安全重复加载和断线重连 |
 | 2026-09-22 会话自动初始化 | CCS20自动listCores/openSession、CPU核匹配、目标会话状态和VOFA首次命令流同步 |
 | 2026-09-23 单连接双向桥接 | VOFA+波形/命令合并为一个TCP连接、取消文本ACK回传、CPU核改为固定下拉选择 |
+| 2026-09-23 VOFA命令配置 | 增加可选 `.cmds.json` 生成、统一数值格式、旧input格式迁移及官方占位符限制 |
+| 2026-10-27 仓库更新 | 上传 VOFA+ 命令配置相关修改；固定 CSV 路径改用预处理宏以适配用户验证的 CCS 5.5 环境；新增 VOFA+ QML 控件开发目录，含示例、波形监视、光斑偏差靶标和 PID 参数调节控件，以及模板、部署和静态检查脚本 |
+
+VOFA+ 控件开发与部署说明见 [vofa_widget_dev/README.md](vofa_widget_dev/README.md)。上述日期记录本次归档上传，不代表所有功能均在该日开发或完成实机验证。
 
 后续建议每次发布记录变更及验证环境，并使用 Git 标签标记实际测试过的版本。
 
